@@ -2,6 +2,9 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+import pandas as pd
+import numpy as np
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
@@ -13,6 +16,7 @@ from config import TG_TOKEN, TG_CHAT_ID, SYMBOLS, SCAN_INTERVAL_MIN, MAX_SIGNALS
 from data import fetch
 from setups import setup_a_asia_breakout, setup_c_trend_pullback, Signal
 from indicators import snapshot
+from backtest import run_backtest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +29,7 @@ dp = Dispatcher()
 
 signals_today = 0
 last_signal_date = None
+_backtest_running = False
 
 
 def fmt_signal(sig: Signal) -> str:
@@ -65,12 +70,8 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 
         now = datetime.now(timezone.utc)
         sig = None
-
-        # Сетап A работает только в лондонскую сессию
         if 7 <= now.hour < 10:
             sig = setup_a_asia_breakout(sym, df_m5, df_m15)
-
-        # Сетап C — в любое время
         if not sig:
             sig = setup_c_trend_pullback(sym, df_h1, df_d1)
 
@@ -93,7 +94,8 @@ async def cmd_start(m: Message):
         "👋 <b>Trade Signals Bot</b>\n\n"
         "Команды:\n"
         "/scan — просканировать рынок\n"
-        "/debug — показать данные по символам\n"
+        "/debug — данные по символам\n"
+        "/backtest — бэктест 90 дней\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
         "/test — тестовый сигнал"
@@ -124,7 +126,7 @@ async def cmd_debug(m: Message):
             continue
 
         if df_m5.empty or df_h1.empty:
-            lines.append(f"❌ <b>{sym}</b>: пустые свечи (Binance не отдал данные)")
+            lines.append(f"❌ <b>{sym}</b>: пустые свечи")
             continue
 
         snap_m5 = snapshot(df_m5)
@@ -163,6 +165,79 @@ async def cmd_debug(m: Message):
         await m.answer(text[i:i + 3500])
 
 
+@dp.message(Command("backtest"))
+async def cmd_backtest(m: Message):
+    global _backtest_running
+    if _backtest_running:
+        await m.answer("⏳ Бэктест уже идёт. Дождись результата.")
+        return
+
+    _backtest_running = True
+    chat_id = m.chat.id
+    await m.answer(
+        "🧪 Запускаю бэктест на 90 дней.\n"
+        "Это займёт 5–15 минут. Я пришлю отчёт, когда закончу.\n"
+        "Можешь пользоваться другими командами."
+    )
+
+    async def progress(text):
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            pass
+
+    async def worker():
+        global _backtest_running
+        try:
+            trades = await run_backtest(SYMBOLS, days=90, progress_cb=progress)
+
+            if not trades:
+                await bot.send_message(chat_id, "❌ Сделок не найдено. Стратегия слишком строгая для этого периода.")
+                return
+
+            df = pd.DataFrame(trades)
+            lines = ["<b>📊 РЕЗУЛЬТАТ БЭКТЕСТА (90 дней)</b>\n"]
+
+            for setup in ["A", "C"]:
+                sub = df[df["setup"] == setup]
+                if len(sub) == 0:
+                    lines.append(f"Сетап {setup}: 0 сделок")
+                    continue
+                wr = (sub["r"] > 0).sum() / len(sub) * 100
+                avg = sub["r"].mean()
+                total = sub["r"].sum()
+                lines.append(
+                    f"<b>Сетап {setup}</b>: {len(sub)} сделок | "
+                    f"WR {wr:.1f}% | AvgR {avg:+.2f} | ΣR {total:+.1f}"
+                )
+
+            wr = (df["r"] > 0).sum() / len(df) * 100
+            avg = df["r"].mean()
+            total = df["r"].sum()
+            sharpe = np.sqrt(len(df)) * avg / df["r"].std() if df["r"].std() > 0 else 0
+
+            lines.append(
+                f"\n<b>ИТОГО</b>\n"
+                f"Сделок: {len(df)}\n"
+                f"Winrate: <b>{wr:.1f}%</b>\n"
+                f"Средний R: <b>{avg:+.3f}</b>\n"
+                f"Суммарный R: <b>{total:+.1f}</b>\n"
+                f"Sharpe: <b>{sharpe:.2f}</b>\n"
+                f"При риске 1% на сделку: <b>{total:+.1f}%</b>"
+            )
+
+            text = "\n".join(lines)
+            for i in range(0, len(text), 3500):
+                await bot.send_message(chat_id, text[i:i + 3500])
+
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ Ошибка бэктеста: <code>{e}</code>")
+        finally:
+            _backtest_running = False
+
+    asyncio.create_task(worker())
+
+
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -186,7 +261,7 @@ async def cmd_test(m: Message):
 
 @dp.message(F.text)
 async def echo(m: Message):
-    await m.answer("Используй /scan, /debug или /start.")
+    await m.answer("Используй /scan, /debug или /backtest.")
 
 
 async def main():
