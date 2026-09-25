@@ -212,13 +212,17 @@ async def run_backtest(symbols, days=90, progress_cb=None):
         df_m5 = await fetch_all(sym, "5m", days)
         df_m15 = await fetch_all(sym, "15m", days)
         df_h1 = await fetch_all(sym, "1h", days)
-        df_d1 = await fetch_all(sym, "1d", days)
+        # D1 качаем минимум 300 свечей, иначе EMA200 D1 не посчитать
+        df_d1 = await fetch_all(sym, "1d", max(days, 300))
 
         if df_m5.empty or df_h1.empty:
             continue
 
         if progress_cb:
-            await progress_cb(f"🔬 [{idx}/{total}] Прогоняю {sym} ({len(df_m5)} свечей M5)...")
+            await progress_cb(
+                f"🔬 [{idx}/{total}] Прогоняю {sym} "
+                f"(M5: {len(df_m5)}, H1: {len(df_h1)}, D1: {len(df_d1)})..."
+            )
 
         for i in range(50, len(df_m5) - 1, 3):
             STATS["total_bars"] += 1
