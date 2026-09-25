@@ -6,21 +6,21 @@ from datetime import datetime, timedelta, timezone
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
-FEE_TAKER = 0.001
-SPREAD = 0.0005
-TOTAL_COST_RATIO = FEE_TAKER * 2 + SPREAD
-
-MAX_TRADES_PER_DAY_PER_SYMBOL = 2
+# ОТКЛЮЧАЕМ ИЗДЕРЖКИ ДЛЯ ДИАГНОСТИКИ
+FEE_TAKER = 0.0
+SPREAD = 0.0
+TOTAL_COST_RATIO = 0.0
 
 STATS = {
     "total_bars": 0,
     "setup_b_checked": 0,
-    "setup_b_atr_out": 0,
-    "setup_b_adx_low": 0,
-    "setup_b_no_level": 0,
-    "setup_b_no_fakeout": 0,
-    "setup_b_session": 0,
-    "daily_limit_skipped": 0,
+    "fakeouts_found": 0,
+    "buy_signals": 0,
+    "sell_signals": 0,
+    "buy_wins": 0,
+    "sell_wins": 0,
+    "buy_r_sum": 0.0,
+    "sell_r_sum": 0.0,
     "signals": 0,
     "simulated": 0,
 }
@@ -58,106 +58,80 @@ def atr(df, p=14):
     return tr.rolling(p).mean()
 
 
-def adx(df, p=14):
-    up = df["high"].diff()
-    down = -df["low"].diff()
-    plus = np.where((up > down) & (up > 0), up, 0.0)
-    minus = np.where((down > up) & (down > 0), down, 0.0)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - df["close"].shift()).abs(),
-        (df["low"] - df["close"].shift()).abs(),
-    ], axis=1).max(axis=1)
-    atr_ = tr.rolling(p).mean()
-    pdi = 100 * pd.Series(plus, index=df.index).rolling(p).mean() / atr_
-    mdi = 100 * pd.Series(minus, index=df.index).rolling(p).mean() / atr_
-    dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
-    return dx.rolling(p).mean()
-
-
-def setup_b(df_h4):
-    """Ложный пробой H4-уровня. Возвращает сигнал или None."""
+def setup_b_raw(df_h4):
+    """
+    БЕЗ ФИЛЬТРОВ. Просто ищем любой ложный пробой.
+    Вход по open СЛЕДУЮЩЕЙ H4-свечи, которая ещё не закрыта на момент cut.
+    """
     STATS["setup_b_checked"] += 1
-
-    if len(df_h4) < 120:
+    if len(df_h4) < 30:
         return None
 
-    a_series = atr(df_h4, 14)
-    a = a_series.iloc[-1]
-    a_avg = a_series.tail(100).mean()
-    if pd.isna(a) or pd.isna(a_avg) or a_avg == 0:
-        STATS["setup_b_atr_out"] += 1
-        return None
-    if not (0.5 * a_avg <= a <= 2.0 * a_avg):
-        STATS["setup_b_atr_out"] += 1
-        return None
-
-    ax = adx(df_h4, 14).iloc[-1]
-    if pd.isna(ax) or ax < 15:
-        STATS["setup_b_adx_low"] += 1
-        return None
-
-    # уровень = high/low за 20 свечей до последней закрытой
+    # уровень — по 20 свечам ДО последней закрытой
     window = df_h4.iloc[-22:-2]
     if len(window) < 10:
-        STATS["setup_b_no_level"] += 1
         return None
     resistance = window["high"].max()
     support = window["low"].min()
 
-    # последняя закрытая свеча H4
-    bar = df_h4.iloc[-2]
+    bar = df_h4.iloc[-2]           # последняя закрытая H4
 
-    # ложный пробой сопротивления: high > resistance, close < resistance
     fake_up = bar["high"] > resistance and bar["close"] < resistance
-    # ложный пробой поддержки: low < support, close > support
     fake_down = bar["low"] < support and bar["close"] > support
 
     if not (fake_up or fake_down):
-        STATS["setup_b_no_fakeout"] += 1
         return None
 
+    STATS["fakeouts_found"] += 1
+
+    a = atr(df_h4, 14).iloc[-1]
+    if pd.isna(a) or a <= 0:
+        a = (bar["high"] - bar["low"]) or 1.0
+
+    # вход по open следующей H4-свечи (индекс -1)
+    entry = df_h4.iloc[-1]["open"]
+
     if fake_up:
-        # вход SELL на открытии следующей свечи (индекс -1)
-        entry_bar = df_h4.iloc[-1]
-        entry = entry_bar["open"]
         sl = bar["high"] + 0.3 * a
         risk = sl - entry
+        if risk <= 0:
+            return None
         tp = entry - 2.0 * risk
+        STATS["sell_signals"] += 1
         return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "B"}
 
     if fake_down:
-        entry_bar = df_h4.iloc[-1]
-        entry = entry_bar["open"]
         sl = bar["low"] - 0.3 * a
         risk = entry - sl
+        if risk <= 0:
+            return None
         tp = entry + 2.0 * risk
+        STATS["buy_signals"] += 1
         return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "B"}
 
     return None
 
 
 def simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=600):
+    """Без издержек. Чистый R."""
     risk = (entry - sl) if side == "BUY" else (sl - entry)
     reward = (tp - entry) if side == "BUY" else (entry - tp)
     if risk <= 0 or reward <= 0:
         return None, from_idx
 
-    cost_in_r = (TOTAL_COST_RATIO * entry) / risk
-
     for i in range(from_idx + 1, min(from_idx + 1 + max_bars, len(df_m5))):
         b = df_m5.iloc[i]
         if side == "BUY":
             if b["low"] <= sl:
-                return round(-1.0 - cost_in_r, 3), i
+                return -1.0, i
             if b["high"] >= tp:
-                return round(reward / risk - cost_in_r, 3), i
+                return round(reward / risk, 2), i
         else:
             if b["high"] >= sl:
-                return round(-1.0 - cost_in_r, 3), i
+                return -1.0, i
             if b["low"] <= tp:
-                return round(reward / risk - cost_in_r, 3), i
-    return round(0.0 - cost_in_r, 3), from_idx + max_bars
+                return round(reward / risk, 2), i
+    return 0.0, from_idx + max_bars
 
 
 async def run_backtest(symbols, days=90, progress_cb=None):
@@ -178,24 +152,16 @@ async def run_backtest(symbols, days=90, progress_cb=None):
                 f"(M5: {len(df_m5)}, H4: {len(df_h4)})..."
             )
 
-        trades_per_day = {}
-
         for i in range(50, len(df_m5) - 1, 6):
             STATS["total_bars"] += 1
             cut = df_m5["datetime"].iloc[i]
 
-            # берём H4-свечи, закрытые ДО момента cut
-            win_h4 = df_h4[df_h4["datetime"] <= cut].tail(120)
-            if len(win_h4) < 120:
+            win_h4 = df_h4[df_h4["datetime"] <= cut].tail(30)
+            if len(win_h4) < 30:
                 continue
 
-            sig = setup_b(win_h4)
+            sig = setup_b_raw(win_h4)
             if not sig:
-                continue
-
-            day = cut.date()
-            if trades_per_day.get(day, 0) >= MAX_TRADES_PER_DAY_PER_SYMBOL:
-                STATS["daily_limit_skipped"] += 1
                 continue
 
             STATS["signals"] += 1
@@ -203,7 +169,16 @@ async def run_backtest(symbols, days=90, progress_cb=None):
             if r is None:
                 continue
             STATS["simulated"] += 1
-            trades_per_day[day] = trades_per_day.get(day, 0) + 1
+
+            if sig["side"] == "BUY":
+                STATS["buy_r_sum"] += r
+                if r > 0:
+                    STATS["buy_wins"] += 1
+            else:
+                STATS["sell_r_sum"] += r
+                if r > 0:
+                    STATS["sell_wins"] += 1
+
             trades.append({
                 "symbol": sym, "setup": sig["setup"], "side": sig["side"],
                 "r": r, "time": cut,
@@ -213,15 +188,15 @@ async def run_backtest(symbols, days=90, progress_cb=None):
 
 
 def stats_report():
+    buy_total = STATS["buy_signals"]
+    sell_total = STATS["sell_signals"]
+    buy_wr = (STATS["buy_wins"] / buy_total * 100) if buy_total else 0
+    sell_wr = (STATS["sell_wins"] / sell_total * 100) if sell_total else 0
     return (
-        "🔍 <b>ВОРОНКА ОТСЕВА — СЕТАП B</b>\n"
+        "🔍 <b>ДИАГНОСТИКА — БЕЗ ФИЛЬТРОВ, БЕЗ ИЗДЕРЖЕК</b>\n"
         f"Всего проверок: {STATS['total_bars']}\n"
-        f"Отсечено лимитом дня: {STATS['daily_limit_skipped']}\n\n"
-        f"<b>Сетап B</b> (проверок: {STATS['setup_b_checked']}):\n"
-        f"  ATR вне коридора: {STATS['setup_b_atr_out']}\n"
-        f"  ADX меньше 15: {STATS['setup_b_adx_low']}\n"
-        f"  нет уровня: {STATS['setup_b_no_level']}\n"
-        f"  нет ложного пробоя: {STATS['setup_b_no_fakeout']}\n\n"
-        f"<b>Найдено сигналов:</b> {STATS['signals']}\n"
-        f"<b>Сделок:</b> {STATS['simulated']}"
+        f"Найдено ложных пробоев: {STATS['fakeouts_found']}\n"
+        f"Сделок: {STATS['simulated']}\n\n"
+        f"<b>BUY</b>: {buy_total} сигналов | WR {buy_wr:.1f}% | ΣR {STATS['buy_r_sum']:+.1f}\n"
+        f"<b>SELL</b>: {sell_total} сигналов | WR {sell_wr:.1f}% | ΣR {STATS['sell_r_sum']:+.1f}"
     )
