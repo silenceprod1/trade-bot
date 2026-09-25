@@ -16,7 +16,7 @@ from config import TG_TOKEN, TG_CHAT_ID, SYMBOLS, SCAN_INTERVAL_MIN, MAX_SIGNALS
 from data import fetch
 from setups import setup_a_asia_breakout, setup_c_trend_pullback, Signal
 from indicators import snapshot
-from backtest import run_backtest
+from backtest import run_backtest, stats_report
 
 logging.basicConfig(
     level=logging.INFO,
@@ -192,7 +192,10 @@ async def cmd_backtest(m: Message):
             trades = await run_backtest(SYMBOLS, days=90, progress_cb=progress)
 
             if not trades:
-                await bot.send_message(chat_id, "❌ Сделок не найдено. Стратегия слишком строгая для этого периода.")
+                await bot.send_message(
+                    chat_id,
+                    "❌ Сделок не найдено.\n\n" + stats_report()
+                )
                 return
 
             df = pd.DataFrame(trades)
@@ -223,7 +226,8 @@ async def cmd_backtest(m: Message):
                 f"Средний R: <b>{avg:+.3f}</b>\n"
                 f"Суммарный R: <b>{total:+.1f}</b>\n"
                 f"Sharpe: <b>{sharpe:.2f}</b>\n"
-                f"При риске 1% на сделку: <b>{total:+.1f}%</b>"
+                f"При риске 1% на сделку: <b>{total:+.1f}%</b>\n\n"
+                + stats_report()
             )
 
             text = "\n".join(lines)
