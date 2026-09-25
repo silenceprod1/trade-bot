@@ -6,6 +6,25 @@ from datetime import datetime, timedelta, timezone
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
+# счётчики отсева
+STATS = {
+    "total_bars": 0,
+    "setup_a_checked": 0,
+    "setup_a_asia_missing": 0,
+    "setup_a_range_wide": 0,
+    "setup_a_no_break": 0,
+    "setup_a_no_retest": 0,
+    "setup_a_low_volume": 0,
+    "setup_a_rsi_block": 0,
+    "setup_c_checked": 0,
+    "setup_c_adx_low": 0,
+    "setup_c_no_trend": 0,
+    "setup_c_far_from_ema": 0,
+    "setup_c_weak_wick": 0,
+    "signals": 0,
+    "simulated": 0,
+}
+
 
 async def fetch_all(symbol, timeframe, days):
     since = exchange.parse8601(
@@ -69,52 +88,96 @@ def adx(df, p=14):
 
 
 def setup_a(df_m5, df_m15):
+    STATS["setup_a_checked"] += 1
     if len(df_m5) < 50 or len(df_m15) < 30:
         return None
     today = df_m5["datetime"].dt.date.iloc[-1]
     asia = df_m5[(df_m5["datetime"].dt.date == today) & (df_m5["datetime"].dt.hour < 7)]
     if len(asia) < 6:
+        STATS["setup_a_asia_missing"] += 1
         return None
     hi, lo = asia["high"].max(), asia["low"].min()
-    if (hi - lo) > 0.05 * hi:          # было 0.03
+    if (hi - lo) > 0.05 * hi:
+        STATS["setup_a_range_wide"] += 1
         return None
     last, prev = df_m5.iloc[-1], df_m5.iloc[-2]
     vol_avg = df_m5["volume"].tail(20).mean() or 1
     r = rsi(df_m15).iloc[-1]
 
-    if prev["close"] > hi and last["low"] <= hi and last["close"] > hi:
-        if last["volume"] > 1.3 * vol_avg and r < 70:
-            return {"side": "BUY", "entry": last["close"], "sl": lo,
-                    "tp": last["close"] + 2.5 * (last["close"] - lo), "setup": "A"}
-    if prev["close"] < lo and last["high"] >= lo and last["close"] < lo:
-        if last["volume"] > 1.3 * vol_avg and r > 30:
-            return {"side": "SELL", "entry": last["close"], "sl": hi,
-                    "tp": last["close"] - 2.5 * (hi - last["close"]), "setup": "A"}
+    broke_up = prev["close"] > hi
+    broke_down = prev["close"] < lo
+    if not (broke_up or broke_down):
+        STATS["setup_a_no_break"] += 1
+        return None
+
+    if broke_up:
+        if not (last["low"] <= hi and last["close"] > hi):
+            STATS["setup_a_no_retest"] += 1
+            return None
+        if last["volume"] <= 1.3 * vol_avg:
+            STATS["setup_a_low_volume"] += 1
+            return None
+        if r >= 70:
+            STATS["setup_a_rsi_block"] += 1
+            return None
+        return {"side": "BUY", "entry": last["close"], "sl": lo,
+                "tp": last["close"] + 2.5 * (last["close"] - lo), "setup": "A"}
+
+    if broke_down:
+        if not (last["high"] >= lo and last["close"] < lo):
+            STATS["setup_a_no_retest"] += 1
+            return None
+        if last["volume"] <= 1.3 * vol_avg:
+            STATS["setup_a_low_volume"] += 1
+            return None
+        if r <= 30:
+            STATS["setup_a_rsi_block"] += 1
+            return None
+        return {"side": "SELL", "entry": last["close"], "sl": hi,
+                "tp": last["close"] - 2.5 * (hi - last["close"]), "setup": "A"}
     return None
 
 
 def setup_c(df_h1, df_d1):
+    STATS["setup_c_checked"] += 1
     if len(df_h1) < 200 or len(df_d1) < 200:
         return None
     ema200 = ema(df_d1["close"], 200).iloc[-1]
     price = df_h1["close"].iloc[-1]
     up = price > ema200
     down = price < ema200
+    if not (up or down):
+        STATS["setup_c_no_trend"] += 1
+        return None
     ema50 = ema(df_h1["close"], 50).iloc[-1]
     a = atr(df_h1, 14).iloc[-1]
     ax = adx(df_h1, 14).iloc[-1]
-    if pd.isna(a) or pd.isna(ax) or ax < 15:   # было 25
+    if pd.isna(a) or pd.isna(ax) or ax < 15:
+        STATS["setup_c_adx_low"] += 1
         return None
     last = df_h1.iloc[-1]
     body = abs(last["close"] - last["open"]) or 1e-9
     lw = min(last["open"], last["close"]) - last["low"]
     uw = last["high"] - max(last["open"], last["close"])
 
-    if up and last["low"] <= ema50 * 1.005 and lw > 1.2 * body:   # было 1.001 / 2
+    if up:
+        if last["low"] > ema50 * 1.005:
+            STATS["setup_c_far_from_ema"] += 1
+            return None
+        if lw <= 1.2 * body:
+            STATS["setup_c_weak_wick"] += 1
+            return None
         sl = last["low"] - 0.2 * a
         return {"side": "BUY", "entry": last["close"], "sl": sl,
                 "tp": last["close"] + 2 * (last["close"] - sl), "setup": "C"}
-    if down and last["high"] >= ema50 * 0.995 and uw > 1.2 * body:  # было 0.999 / 2
+
+    if down:
+        if last["high"] < ema50 * 0.995:
+            STATS["setup_c_far_from_ema"] += 1
+            return None
+        if uw <= 1.2 * body:
+            STATS["setup_c_weak_wick"] += 1
+            return None
         sl = last["high"] + 0.2 * a
         return {"side": "SELL", "entry": last["close"], "sl": sl,
                 "tp": last["close"] - 2 * (sl - last["close"]), "setup": "C"}
@@ -159,6 +222,7 @@ async def run_backtest(symbols, days=90, progress_cb=None):
             await progress_cb(f"🔬 [{idx}/{total}] Прогоняю {sym} ({len(df_m5)} свечей M5)...")
 
         for i in range(50, len(df_m5) - 1, 3):
+            STATS["total_bars"] += 1
             win_m5 = df_m5.iloc[:i + 1]
             cut = win_m5["datetime"].iloc[-1]
             win_m15 = df_m15[df_m15["datetime"] <= cut].tail(50)
@@ -175,12 +239,34 @@ async def run_backtest(symbols, days=90, progress_cb=None):
                 sig = setup_c(win_h1, win_d1)
 
             if sig:
+                STATS["signals"] += 1
                 r, _ = simulate(sig["side"], sig["entry"], sig["sl"], sig["tp"], df_m5, i)
                 if r is None:
                     continue
+                STATS["simulated"] += 1
                 trades.append({
                     "symbol": sym, "setup": sig["setup"], "side": sig["side"],
                     "r": r, "time": win_m5["datetime"].iloc[-1],
                 })
 
     return trades
+
+
+def stats_report():
+    return (
+        "<b>🔍 ВОРОНКА ОТСЕВА</b>\n"
+        f"Всего проверок: {STATS['total_bars']}\n\n"
+        f"<b>Сетап A</b> (всего {STATS['setup_a_checked']}):\n"
+        f"  нет азиатского диапазона: {STATS['setup_a_asia_missing']}\n"
+        f"  диапазон > 5%: {STATS['setup_a_range_wide']}\n"
+        f"  нет пробоя: {STATS['setup_a_no_break']}\n"
+        f"  нет ретеста: {STATS['setup_a_no_retest']}\n"
+        f"  слабый объём: {STATS['setup_a_low_volume']}\n"
+        f"  RSI блок: {STATS['setup_a_rsi_block']}\n\n"
+        f"<b>Сетап C</b> (всего {STATS['setup_c_checked']}):\n"
+        f"  ADX < 15: {STATS['setup_c_adx_low']}\n"
+        f"  далеко от EMA50: {STATS['setup_c_far_from_ema']}\n"
+        f"  слабый пин-бар: {STATS['setup_c_weak_wick']}\n\n"
+        f"<b>Найдено сигналов:</b> {STATS['signals']}\n"
+        f"<b>Сделок:</b> {STATS['simulated']}"
+    )
