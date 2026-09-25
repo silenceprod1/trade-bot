@@ -6,6 +6,14 @@ from datetime import datetime, timedelta, timezone
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
+# издержки (доля от цены входа)
+FEE_TAKER = 0.001       # 0.1% комиссия Binance
+SPREAD = 0.0005         # 0.05% спред
+TOTAL_COST_RATIO = FEE_TAKER * 2 + SPREAD   # 0.25% от цены
+
+# лимит: не больше 1 сделки в день на символ
+MAX_TRADES_PER_DAY_PER_SYMBOL = 1
+
 STATS = {
     "total_bars": 0,
     "setup_a_checked": 0,
@@ -23,6 +31,7 @@ STATS = {
     "setup_c_session": 0,
     "setup_c_no_confirm": 0,
     "setup_c_atr": 0,
+    "daily_limit_skipped": 0,
     "signals": 0,
     "simulated": 0,
 }
@@ -141,7 +150,7 @@ def setup_a(df_m5, df_m15):
 
 
 def setup_c(df_h1, df_d1):
-    """ИНВЕРТИРОВАННЫЙ сетап C — для проверки симуляции."""
+    """Инвертированный сетап C. TP=2R. С издержками."""
     STATS["setup_c_checked"] += 1
     if len(df_h1) < 220 or len(df_d1) < 200:
         return None
@@ -185,13 +194,11 @@ def setup_c(df_h1, df_d1):
         STATS["setup_c_far_from_ema"] += 1
         return None
 
-    # ИНВЕРСИЯ: было BUY — стало SELL, и наоборот
     if touch_buy:
         confirm = last["close"] > last["open"] and last["close"] > prev["high"]
         if not confirm:
             STATS["setup_c_no_confirm"] += 1
             return None
-        # инвертируем: SELL
         sl = max(prev["high"], last["high"]) + 0.2 * a
         entry = last["close"]
         risk = sl - entry
@@ -203,7 +210,6 @@ def setup_c(df_h1, df_d1):
         if not confirm:
             STATS["setup_c_no_confirm"] += 1
             return None
-        # инвертируем: BUY
         sl = min(prev["low"], last["low"]) - 0.2 * a
         entry = last["close"]
         risk = entry - sl
@@ -215,23 +221,28 @@ def setup_c(df_h1, df_d1):
 
 
 def simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=300):
+    """Симуляция с учётом издержек."""
     risk = (entry - sl) if side == "BUY" else (sl - entry)
     reward = (tp - entry) if side == "BUY" else (entry - tp)
     if risk <= 0 or reward <= 0:
         return None, from_idx
+
+    cost_in_price = TOTAL_COST_RATIO * entry       # издержки в единицах цены
+    cost_in_r = cost_in_price / risk                # издержки в R
+
     for i in range(from_idx + 1, min(from_idx + 1 + max_bars, len(df_m5))):
         b = df_m5.iloc[i]
         if side == "BUY":
             if b["low"] <= sl:
-                return -1.0, i
+                return round(-1.0 - cost_in_r, 3), i
             if b["high"] >= tp:
-                return round(reward / risk, 2), i
+                return round(reward / risk - cost_in_r, 3), i
         else:
             if b["high"] >= sl:
-                return -1.0, i
+                return round(-1.0 - cost_in_r, 3), i
             if b["low"] <= tp:
-                return round(reward / risk, 2), i
-    return 0.0, from_idx + max_bars
+                return round(reward / risk - cost_in_r, 3), i
+    return round(0.0 - cost_in_r, 3), from_idx + max_bars
 
 
 async def run_backtest(symbols, days=90, progress_cb=None):
@@ -254,6 +265,8 @@ async def run_backtest(symbols, days=90, progress_cb=None):
                 f"(M5: {len(df_m5)}, H1: {len(df_h1)}, D1: {len(df_d1)})..."
             )
 
+        trades_per_day = {}   # {date: count}
+
         for i in range(50, len(df_m5) - 1, 3):
             STATS["total_bars"] += 1
             win_m5 = df_m5.iloc[:i + 1]
@@ -271,16 +284,25 @@ async def run_backtest(symbols, days=90, progress_cb=None):
             if not sig:
                 sig = setup_c(win_h1, win_d1)
 
-            if sig:
-                STATS["signals"] += 1
-                r, _ = simulate(sig["side"], sig["entry"], sig["sl"], sig["tp"], df_m5, i)
-                if r is None:
-                    continue
-                STATS["simulated"] += 1
-                trades.append({
-                    "symbol": sym, "setup": sig["setup"], "side": sig["side"],
-                    "r": r, "time": win_m5["datetime"].iloc[-1],
-                })
+            if not sig:
+                continue
+
+            # лимит сделок в день
+            day = cut.date()
+            if trades_per_day.get(day, 0) >= MAX_TRADES_PER_DAY_PER_SYMBOL:
+                STATS["daily_limit_skipped"] += 1
+                continue
+
+            STATS["signals"] += 1
+            r, _ = simulate(sig["side"], sig["entry"], sig["sl"], sig["tp"], df_m5, i)
+            if r is None:
+                continue
+            STATS["simulated"] += 1
+            trades_per_day[day] = trades_per_day.get(day, 0) + 1
+            trades.append({
+                "symbol": sym, "setup": sig["setup"], "side": sig["side"],
+                "r": r, "time": win_m5["datetime"].iloc[-1],
+            })
 
     return trades
 
@@ -288,7 +310,8 @@ async def run_backtest(symbols, days=90, progress_cb=None):
 def stats_report():
     return (
         "🔍 <b>ВОРОНКА ОТСЕВА</b>\n"
-        f"Всего проверок: {STATS['total_bars']}\n\n"
+        f"Всего проверок: {STATS['total_bars']}\n"
+        f"Отсечено лимитом дня: {STATS['daily_limit_skipped']}\n\n"
         f"<b>Сетап A</b> (проверок: {STATS['setup_a_checked']}):\n"
         f"  нет азиатского диапазона: {STATS['setup_a_asia_missing']}\n"
         f"  диапазон больше 5%: {STATS['setup_a_range_wide']}\n"
