@@ -30,7 +30,6 @@ def setup_a_asia_breakout(symbol: str, df_m5: pd.DataFrame, df_m15: pd.DataFrame
 
     hi, lo = asia["high"].max(), asia["low"].min()
     rng = hi - lo
-    # фильтр слишком широкого диапазона (для крипты 3%, для форекса было 0.3%)
     if rng > 0.03 * hi:
         return None
 
@@ -40,7 +39,6 @@ def setup_a_asia_breakout(symbol: str, df_m5: pd.DataFrame, df_m15: pd.DataFrame
 
     r = rsi(df_m15).iloc[-1]
 
-    # пробой вверх + ретест
     if prev["close"] > hi and last["low"] <= hi and last["close"] > hi:
         if last["volume"] > 1.3 * vol_avg and r < 70:
             sl = lo
@@ -48,7 +46,6 @@ def setup_a_asia_breakout(symbol: str, df_m5: pd.DataFrame, df_m15: pd.DataFrame
             return Signal(symbol, "BUY", last["close"], sl, tp, "A",
                           f"Asia breakout+retest, RSI={r:.1f}")
 
-    # пробой вниз + ретест
     if prev["close"] < lo and last["high"] >= lo and last["close"] < lo:
         if last["volume"] > 1.3 * vol_avg and r > 30:
             sl = hi
