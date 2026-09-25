@@ -95,7 +95,7 @@ async def cmd_start(m: Message):
         "Команды:\n"
         "/scan — просканировать рынок\n"
         "/debug — данные по символам\n"
-        "/backtest — бэктест 90 дней\n"
+        "/backtest — диагностика 5 гипотез (90 дней)\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
         "/test — тестовый сигнал"
@@ -175,9 +175,8 @@ async def cmd_backtest(m: Message):
     _backtest_running = True
     chat_id = m.chat.id
     await m.answer(
-        "🧪 Запускаю бэктест на 90 дней.\n"
-        "Это займёт 5–15 минут. Я пришлю отчёт, когда закончу.\n"
-        "Можешь пользоваться другими командами."
+        "🧪 Запускаю диагностику 5 гипотез на 90 дней.\n"
+        "Это займёт 10–20 минут. Я пришлю отчёт, когда закончу."
     )
 
     async def progress(text):
@@ -189,53 +188,30 @@ async def cmd_backtest(m: Message):
     async def worker():
         global _backtest_running
         try:
-            trades = await run_backtest(SYMBOLS, days=90, progress_cb=progress)
+            results = await run_backtest(SYMBOLS, days=90, progress_cb=progress)
 
-            if not trades:
-                await bot.send_message(
-                    chat_id,
-                    "❌ Сделок не найдено.\n\n" + stats_report()
-                )
-                return
+            all_trades = []
+            for k, v in results.items():
+                all_trades.extend(v)
 
-            df = pd.DataFrame(trades)
-            lines = ["<b>📊 РЕЗУЛЬТАТ БЭКТЕСТА (90 дней)</b>\n"]
+            lines = [stats_report(results)]
 
-            for setup in ["A", "C"]:
-                sub = df[df["setup"] == setup]
-                if len(sub) == 0:
-                    lines.append(f"Сетап {setup}: 0 сделок")
-                    continue
-                wr = (sub["r"] > 0).sum() / len(sub) * 100
-                avg = sub["r"].mean()
-                total = sub["r"].sum()
+            if all_trades:
+                r_arr = np.array([t["r"] for t in all_trades])
+                wr = (r_arr > 0).sum() / len(r_arr) * 100
+                avg = r_arr.mean()
+                total = r_arr.sum()
                 lines.append(
-                    f"<b>Сетап {setup}</b>: {len(sub)} сделок | "
-                    f"WR {wr:.1f}% | AvgR {avg:+.2f} | ΣR {total:+.1f}"
+                    f"\n<b>ВСЕГО</b>: {len(all_trades)} сд. | "
+                    f"WR {wr:.1f}% | AvgR {avg:+.3f} | ΣR {total:+.1f}"
                 )
-
-            wr = (df["r"] > 0).sum() / len(df) * 100
-            avg = df["r"].mean()
-            total = df["r"].sum()
-            sharpe = np.sqrt(len(df)) * avg / df["r"].std() if df["r"].std() > 0 else 0
-
-            lines.append(
-                f"\n<b>ИТОГО</b>\n"
-                f"Сделок: {len(df)}\n"
-                f"Winrate: <b>{wr:.1f}%</b>\n"
-                f"Средний R: <b>{avg:+.3f}</b>\n"
-                f"Суммарный R: <b>{total:+.1f}</b>\n"
-                f"Sharpe: <b>{sharpe:.2f}</b>\n"
-                f"При риске 1% на сделку: <b>{total:+.1f}%</b>\n\n"
-                + stats_report()
-            )
 
             text = "\n".join(lines)
             for i in range(0, len(text), 3500):
                 await bot.send_message(chat_id, text[i:i + 3500])
 
         except Exception as e:
-            await bot.send_message(chat_id, f"❌ Ошибка бэктеста: <code>{e}</code>")
+            await bot.send_message(chat_id, f"❌ Ошибка: <code>{e}</code>")
         finally:
             _backtest_running = False
 
