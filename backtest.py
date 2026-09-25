@@ -141,12 +141,11 @@ def setup_a(df_m5, df_m15):
 
 
 def setup_c(df_h1, df_d1):
-    """Новый сетап C: трендовый откат с подтверждением."""
+    """Сетап C: трендовый откат с подтверждением. TP = 3R."""
     STATS["setup_c_checked"] += 1
     if len(df_h1) < 220 or len(df_d1) < 200:
         return None
 
-    # 1. Тренд на D1
     ema200_d1 = ema(df_d1["close"], 200).iloc[-1]
     price_d1 = df_d1["close"].iloc[-1]
     up = price_d1 > ema200_d1
@@ -155,13 +154,11 @@ def setup_c(df_h1, df_d1):
         STATS["setup_c_no_trend"] += 1
         return None
 
-    # 2. ADX > 25 на H1
     ax = adx(df_h1, 14).iloc[-1]
     if pd.isna(ax) or ax < 25:
         STATS["setup_c_adx_low"] += 1
         return None
 
-    # 3. ATR-фильтр: ATR в пределах 0.5–2.0 среднего за 100 свечей
     a_series = atr(df_h1, 14)
     a = a_series.iloc[-1]
     a_avg = a_series.tail(100).mean()
@@ -172,12 +169,10 @@ def setup_c(df_h1, df_d1):
         STATS["setup_c_atr"] += 1
         return None
 
-    # 4. Касание EMA50 H1 — на последней закрытой свече (индекс -2)
     ema50 = ema(df_h1["close"], 50).iloc[-2]
-    prev = df_h1.iloc[-2]   # свеча касания
-    last = df_h1.iloc[-1]   # свеча подтверждения
+    prev = df_h1.iloc[-2]
+    last = df_h1.iloc[-1]
 
-    # 5. Сессионный фильтр
     h = last["datetime"].hour
     if not (7 <= h < 20):
         STATS["setup_c_session"] += 1
@@ -190,7 +185,6 @@ def setup_c(df_h1, df_d1):
         STATS["setup_c_far_from_ema"] += 1
         return None
 
-    # 6. Подтверждение: следующая свеча закрывается в сторону тренда
     if touch_buy:
         confirm = last["close"] > last["open"] and last["close"] > prev["high"]
         if not confirm:
@@ -199,7 +193,7 @@ def setup_c(df_h1, df_d1):
         sl = min(prev["low"], last["low"]) - 0.2 * a
         entry = last["close"]
         risk = entry - sl
-        tp = entry + 1.5 * risk
+        tp = entry + 3.0 * risk      # было 1.5R, теперь 3R
         return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
 
     if touch_sell:
@@ -210,7 +204,7 @@ def setup_c(df_h1, df_d1):
         sl = max(prev["high"], last["high"]) + 0.2 * a
         entry = last["close"]
         risk = sl - entry
-        tp = entry - 1.5 * risk
+        tp = entry - 3.0 * risk      # было 1.5R, теперь 3R
         return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
 
     STATS["setup_c_weak_wick"] += 1
