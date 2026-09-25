@@ -76,7 +76,7 @@ def setup_a(df_m5, df_m15):
     if len(asia) < 6:
         return None
     hi, lo = asia["high"].max(), asia["low"].min()
-    if (hi - lo) > 0.03 * hi:
+    if (hi - lo) > 0.05 * hi:          # было 0.03
         return None
     last, prev = df_m5.iloc[-1], df_m5.iloc[-2]
     vol_avg = df_m5["volume"].tail(20).mean() or 1
@@ -103,18 +103,18 @@ def setup_c(df_h1, df_d1):
     ema50 = ema(df_h1["close"], 50).iloc[-1]
     a = atr(df_h1, 14).iloc[-1]
     ax = adx(df_h1, 14).iloc[-1]
-    if pd.isna(a) or pd.isna(ax) or ax < 25:
+    if pd.isna(a) or pd.isna(ax) or ax < 15:   # было 25
         return None
     last = df_h1.iloc[-1]
     body = abs(last["close"] - last["open"]) or 1e-9
     lw = min(last["open"], last["close"]) - last["low"]
     uw = last["high"] - max(last["open"], last["close"])
 
-    if up and last["low"] <= ema50 * 1.001 and lw > 2 * body:
+    if up and last["low"] <= ema50 * 1.005 and lw > 1.2 * body:   # было 1.001 / 2
         sl = last["low"] - 0.2 * a
         return {"side": "BUY", "entry": last["close"], "sl": sl,
                 "tp": last["close"] + 2 * (last["close"] - sl), "setup": "C"}
-    if down and last["high"] >= ema50 * 0.999 and uw > 2 * body:
+    if down and last["high"] >= ema50 * 0.995 and uw > 1.2 * body:  # было 0.999 / 2
         sl = last["high"] + 0.2 * a
         return {"side": "SELL", "entry": last["close"], "sl": sl,
                 "tp": last["close"] - 2 * (sl - last["close"]), "setup": "C"}
