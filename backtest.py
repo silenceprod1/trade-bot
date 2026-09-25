@@ -141,7 +141,7 @@ def setup_a(df_m5, df_m15):
 
 
 def setup_c(df_h1, df_d1):
-    """Сетап C: трендовый откат с подтверждением. TP = 3R."""
+    """ИНВЕРТИРОВАННЫЙ сетап C — для проверки симуляции."""
     STATS["setup_c_checked"] += 1
     if len(df_h1) < 220 or len(df_d1) < 200:
         return None
@@ -185,27 +185,30 @@ def setup_c(df_h1, df_d1):
         STATS["setup_c_far_from_ema"] += 1
         return None
 
+    # ИНВЕРСИЯ: было BUY — стало SELL, и наоборот
     if touch_buy:
         confirm = last["close"] > last["open"] and last["close"] > prev["high"]
         if not confirm:
             STATS["setup_c_no_confirm"] += 1
             return None
-        sl = min(prev["low"], last["low"]) - 0.2 * a
+        # инвертируем: SELL
+        sl = max(prev["high"], last["high"]) + 0.2 * a
         entry = last["close"]
-        risk = entry - sl
-        tp = entry + 3.0 * risk      # было 1.5R, теперь 3R
-        return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
+        risk = sl - entry
+        tp = entry - 2.0 * risk
+        return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
 
     if touch_sell:
         confirm = last["close"] < last["open"] and last["close"] < prev["low"]
         if not confirm:
             STATS["setup_c_no_confirm"] += 1
             return None
-        sl = max(prev["high"], last["high"]) + 0.2 * a
+        # инвертируем: BUY
+        sl = min(prev["low"], last["low"]) - 0.2 * a
         entry = last["close"]
-        risk = sl - entry
-        tp = entry - 3.0 * risk      # было 1.5R, теперь 3R
-        return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
+        risk = entry - sl
+        tp = entry + 2.0 * risk
+        return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
 
     STATS["setup_c_weak_wick"] += 1
     return None
@@ -293,7 +296,7 @@ def stats_report():
         f"  нет ретеста: {STATS['setup_a_no_retest']}\n"
         f"  слабый объём: {STATS['setup_a_low_volume']}\n"
         f"  RSI блок: {STATS['setup_a_rsi_block']}\n\n"
-        f"<b>Сетап C</b> (проверок: {STATS['setup_c_checked']}):\n"
+        f"<b>Сетап C (ИНВЕРТИРОВАННЫЙ)</b> (проверок: {STATS['setup_c_checked']}):\n"
         f"  ADX меньше 25: {STATS['setup_c_adx_low']}\n"
         f"  нет тренда: {STATS['setup_c_no_trend']}\n"
         f"  ATR вне коридора: {STATS['setup_c_atr']}\n"
