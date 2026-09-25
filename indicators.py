@@ -41,3 +41,21 @@ def adx(df: pd.DataFrame, p: int = 14) -> pd.Series:
     mdi = 100 * pd.Series(minus, index=df.index).rolling(p).mean() / atr_
     dx = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
     return dx.rolling(p).mean()
+
+
+def snapshot(df: pd.DataFrame) -> dict:
+    """Быстрый срез текущего состояния рынка для дебага."""
+    if df is None or len(df) < 50:
+        return {}
+    close = df["close"]
+    rsi_series = rsi(df, 14)
+    atr_series = atr(df, 14)
+    adx_series = adx(df, 14)
+    return {
+        "last_close": float(close.iloc[-1]),
+        "ema50": float(ema(close, 50).iloc[-1]),
+        "ema200": float(ema(close, 200).iloc[-1]) if len(df) >= 200 else 0.0,
+        "rsi14": float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 0.0,
+        "atr14": float(atr_series.iloc[-1]) if not pd.isna(atr_series.iloc[-1]) else 0.0,
+        "adx14": float(adx_series.iloc[-1]) if len(df) >= 30 and not pd.isna(adx_series.iloc[-1]) else 0.0,
+    }
