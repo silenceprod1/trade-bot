@@ -20,6 +20,9 @@ STATS = {
     "setup_c_no_trend": 0,
     "setup_c_far_from_ema": 0,
     "setup_c_weak_wick": 0,
+    "setup_c_session": 0,
+    "setup_c_no_confirm": 0,
+    "setup_c_atr": 0,
     "signals": 0,
     "simulated": 0,
 }
@@ -138,52 +141,83 @@ def setup_a(df_m5, df_m15):
 
 
 def setup_c(df_h1, df_d1):
+    """Новый сетап C: трендовый откат с подтверждением."""
     STATS["setup_c_checked"] += 1
-    if len(df_h1) < 200 or len(df_d1) < 200:
+    if len(df_h1) < 220 or len(df_d1) < 200:
         return None
-    ema200 = ema(df_d1["close"], 200).iloc[-1]
-    price = df_h1["close"].iloc[-1]
-    up = price > ema200
-    down = price < ema200
+
+    # 1. Тренд на D1
+    ema200_d1 = ema(df_d1["close"], 200).iloc[-1]
+    price_d1 = df_d1["close"].iloc[-1]
+    up = price_d1 > ema200_d1
+    down = price_d1 < ema200_d1
     if not (up or down):
         STATS["setup_c_no_trend"] += 1
         return None
-    ema50 = ema(df_h1["close"], 50).iloc[-1]
-    a = atr(df_h1, 14).iloc[-1]
+
+    # 2. ADX > 25 на H1
     ax = adx(df_h1, 14).iloc[-1]
-    if pd.isna(a) or pd.isna(ax) or ax < 15:
+    if pd.isna(ax) or ax < 25:
         STATS["setup_c_adx_low"] += 1
         return None
-    last = df_h1.iloc[-1]
-    body = abs(last["close"] - last["open"]) or 1e-9
-    lw = min(last["open"], last["close"]) - last["low"]
-    uw = last["high"] - max(last["open"], last["close"])
 
-    if up:
-        if last["low"] > ema50 * 1.005:
-            STATS["setup_c_far_from_ema"] += 1
-            return None
-        if lw <= 1.2 * body:
-            STATS["setup_c_weak_wick"] += 1
-            return None
-        sl = last["low"] - 0.2 * a
-        return {"side": "BUY", "entry": last["close"], "sl": sl,
-                "tp": last["close"] + 2 * (last["close"] - sl), "setup": "C"}
+    # 3. ATR-фильтр: ATR в пределах 0.5–2.0 среднего за 100 свечей
+    a_series = atr(df_h1, 14)
+    a = a_series.iloc[-1]
+    a_avg = a_series.tail(100).mean()
+    if pd.isna(a) or pd.isna(a_avg) or a_avg == 0:
+        STATS["setup_c_atr"] += 1
+        return None
+    if not (0.5 * a_avg <= a <= 2.0 * a_avg):
+        STATS["setup_c_atr"] += 1
+        return None
 
-    if down:
-        if last["high"] < ema50 * 0.995:
-            STATS["setup_c_far_from_ema"] += 1
+    # 4. Касание EMA50 H1 — на последней закрытой свече (индекс -2)
+    ema50 = ema(df_h1["close"], 50).iloc[-2]
+    prev = df_h1.iloc[-2]   # свеча касания
+    last = df_h1.iloc[-1]   # свеча подтверждения
+
+    # 5. Сессионный фильтр
+    h = last["datetime"].hour
+    if not (7 <= h < 20):
+        STATS["setup_c_session"] += 1
+        return None
+
+    touch_buy = up and prev["low"] <= ema50 * 1.002
+    touch_sell = down and prev["high"] >= ema50 * 0.998
+
+    if not (touch_buy or touch_sell):
+        STATS["setup_c_far_from_ema"] += 1
+        return None
+
+    # 6. Подтверждение: следующая свеча закрывается в сторону тренда
+    if touch_buy:
+        confirm = last["close"] > last["open"] and last["close"] > prev["high"]
+        if not confirm:
+            STATS["setup_c_no_confirm"] += 1
             return None
-        if uw <= 1.2 * body:
-            STATS["setup_c_weak_wick"] += 1
+        sl = min(prev["low"], last["low"]) - 0.2 * a
+        entry = last["close"]
+        risk = entry - sl
+        tp = entry + 1.5 * risk
+        return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
+
+    if touch_sell:
+        confirm = last["close"] < last["open"] and last["close"] < prev["low"]
+        if not confirm:
+            STATS["setup_c_no_confirm"] += 1
             return None
-        sl = last["high"] + 0.2 * a
-        return {"side": "SELL", "entry": last["close"], "sl": sl,
-                "tp": last["close"] - 2 * (sl - last["close"]), "setup": "C"}
+        sl = max(prev["high"], last["high"]) + 0.2 * a
+        entry = last["close"]
+        risk = sl - entry
+        tp = entry - 1.5 * risk
+        return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
+
+    STATS["setup_c_weak_wick"] += 1
     return None
 
 
-def simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=200):
+def simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=300):
     risk = (entry - sl) if side == "BUY" else (sl - entry)
     reward = (tp - entry) if side == "BUY" else (entry - tp)
     if risk <= 0 or reward <= 0:
@@ -212,7 +246,6 @@ async def run_backtest(symbols, days=90, progress_cb=None):
         df_m5 = await fetch_all(sym, "5m", days)
         df_m15 = await fetch_all(sym, "15m", days)
         df_h1 = await fetch_all(sym, "1h", days)
-        # D1 качаем минимум 300 свечей, иначе EMA200 D1 не посчитать
         df_d1 = await fetch_all(sym, "1d", max(days, 300))
 
         if df_m5.empty or df_h1.empty:
@@ -229,9 +262,9 @@ async def run_backtest(symbols, days=90, progress_cb=None):
             win_m5 = df_m5.iloc[:i + 1]
             cut = win_m5["datetime"].iloc[-1]
             win_m15 = df_m15[df_m15["datetime"] <= cut].tail(50)
-            win_h1 = df_h1[df_h1["datetime"] <= cut].tail(200)
+            win_h1 = df_h1[df_h1["datetime"] <= cut].tail(220)
             win_d1 = df_d1[df_d1["datetime"] <= cut].tail(200)
-            if len(win_m15) < 30 or len(win_h1) < 200 or len(win_d1) < 200:
+            if len(win_m15) < 30 or len(win_h1) < 220 or len(win_d1) < 200:
                 continue
 
             sig = None
@@ -267,9 +300,12 @@ def stats_report():
         f"  слабый объём: {STATS['setup_a_low_volume']}\n"
         f"  RSI блок: {STATS['setup_a_rsi_block']}\n\n"
         f"<b>Сетап C</b> (проверок: {STATS['setup_c_checked']}):\n"
-        f"  ADX меньше 15: {STATS['setup_c_adx_low']}\n"
+        f"  ADX меньше 25: {STATS['setup_c_adx_low']}\n"
+        f"  нет тренда: {STATS['setup_c_no_trend']}\n"
+        f"  ATR вне коридора: {STATS['setup_c_atr']}\n"
+        f"  вне сессии: {STATS['setup_c_session']}\n"
         f"  далеко от EMA50: {STATS['setup_c_far_from_ema']}\n"
-        f"  слабый пин-бар: {STATS['setup_c_weak_wick']}\n\n"
+        f"  нет подтверждения: {STATS['setup_c_no_confirm']}\n\n"
         f"<b>Найдено сигналов:</b> {STATS['signals']}\n"
         f"<b>Сделок:</b> {STATS['simulated']}"
     )
