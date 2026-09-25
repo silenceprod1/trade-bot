@@ -6,31 +6,20 @@ from datetime import datetime, timedelta, timezone
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
-# издержки (доля от цены входа)
-FEE_TAKER = 0.001       # 0.1% комиссия Binance
-SPREAD = 0.0005         # 0.05% спред
-TOTAL_COST_RATIO = FEE_TAKER * 2 + SPREAD   # 0.25% от цены
+FEE_TAKER = 0.001
+SPREAD = 0.0005
+TOTAL_COST_RATIO = FEE_TAKER * 2 + SPREAD
 
-# лимит: не больше 1 сделки в день на символ
-MAX_TRADES_PER_DAY_PER_SYMBOL = 1
+MAX_TRADES_PER_DAY_PER_SYMBOL = 2
 
 STATS = {
     "total_bars": 0,
-    "setup_a_checked": 0,
-    "setup_a_asia_missing": 0,
-    "setup_a_range_wide": 0,
-    "setup_a_no_break": 0,
-    "setup_a_no_retest": 0,
-    "setup_a_low_volume": 0,
-    "setup_a_rsi_block": 0,
-    "setup_c_checked": 0,
-    "setup_c_adx_low": 0,
-    "setup_c_no_trend": 0,
-    "setup_c_far_from_ema": 0,
-    "setup_c_weak_wick": 0,
-    "setup_c_session": 0,
-    "setup_c_no_confirm": 0,
-    "setup_c_atr": 0,
+    "setup_b_checked": 0,
+    "setup_b_atr_out": 0,
+    "setup_b_adx_low": 0,
+    "setup_b_no_level": 0,
+    "setup_b_no_fakeout": 0,
+    "setup_b_session": 0,
     "daily_limit_skipped": 0,
     "signals": 0,
     "simulated": 0,
@@ -63,18 +52,6 @@ async def fetch_all(symbol, timeframe, days):
     return df
 
 
-def ema(s, p):
-    return s.ewm(span=p, adjust=False).mean()
-
-
-def rsi(df, p=14):
-    d = df["close"].diff()
-    gain = d.clip(lower=0).rolling(p).mean()
-    loss = (-d.clip(upper=0)).rolling(p).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - 100 / (1 + rs)
-
-
 def atr(df, p=14):
     h, l, c = df["high"], df["low"], df["close"]
     tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
@@ -98,137 +75,75 @@ def adx(df, p=14):
     return dx.rolling(p).mean()
 
 
-def setup_a(df_m5, df_m15):
-    STATS["setup_a_checked"] += 1
-    if len(df_m5) < 50 or len(df_m15) < 30:
-        return None
-    today = df_m5["datetime"].dt.date.iloc[-1]
-    asia = df_m5[(df_m5["datetime"].dt.date == today) & (df_m5["datetime"].dt.hour < 7)]
-    if len(asia) < 6:
-        STATS["setup_a_asia_missing"] += 1
-        return None
-    hi, lo = asia["high"].max(), asia["low"].min()
-    if (hi - lo) > 0.05 * hi:
-        STATS["setup_a_range_wide"] += 1
-        return None
-    last, prev = df_m5.iloc[-1], df_m5.iloc[-2]
-    vol_avg = df_m5["volume"].tail(20).mean() or 1
-    r = rsi(df_m15).iloc[-1]
+def setup_b(df_h4):
+    """Ложный пробой H4-уровня. Возвращает сигнал или None."""
+    STATS["setup_b_checked"] += 1
 
-    broke_up = prev["close"] > hi
-    broke_down = prev["close"] < lo
-    if not (broke_up or broke_down):
-        STATS["setup_a_no_break"] += 1
+    if len(df_h4) < 120:
         return None
 
-    if broke_up:
-        if not (last["low"] <= hi and last["close"] > hi):
-            STATS["setup_a_no_retest"] += 1
-            return None
-        if last["volume"] <= 1.3 * vol_avg:
-            STATS["setup_a_low_volume"] += 1
-            return None
-        if r >= 70:
-            STATS["setup_a_rsi_block"] += 1
-            return None
-        return {"side": "BUY", "entry": last["close"], "sl": lo,
-                "tp": last["close"] + 2.5 * (last["close"] - lo), "setup": "A"}
-
-    if broke_down:
-        if not (last["high"] >= lo and last["close"] < lo):
-            STATS["setup_a_no_retest"] += 1
-            return None
-        if last["volume"] <= 1.3 * vol_avg:
-            STATS["setup_a_low_volume"] += 1
-            return None
-        if r <= 30:
-            STATS["setup_a_rsi_block"] += 1
-            return None
-        return {"side": "SELL", "entry": last["close"], "sl": hi,
-                "tp": last["close"] - 2.5 * (hi - last["close"]), "setup": "A"}
-    return None
-
-
-def setup_c(df_h1, df_d1):
-    """Инвертированный сетап C. TP=2R. С издержками."""
-    STATS["setup_c_checked"] += 1
-    if len(df_h1) < 220 or len(df_d1) < 200:
-        return None
-
-    ema200_d1 = ema(df_d1["close"], 200).iloc[-1]
-    price_d1 = df_d1["close"].iloc[-1]
-    up = price_d1 > ema200_d1
-    down = price_d1 < ema200_d1
-    if not (up or down):
-        STATS["setup_c_no_trend"] += 1
-        return None
-
-    ax = adx(df_h1, 14).iloc[-1]
-    if pd.isna(ax) or ax < 25:
-        STATS["setup_c_adx_low"] += 1
-        return None
-
-    a_series = atr(df_h1, 14)
+    a_series = atr(df_h4, 14)
     a = a_series.iloc[-1]
     a_avg = a_series.tail(100).mean()
     if pd.isna(a) or pd.isna(a_avg) or a_avg == 0:
-        STATS["setup_c_atr"] += 1
+        STATS["setup_b_atr_out"] += 1
         return None
     if not (0.5 * a_avg <= a <= 2.0 * a_avg):
-        STATS["setup_c_atr"] += 1
+        STATS["setup_b_atr_out"] += 1
         return None
 
-    ema50 = ema(df_h1["close"], 50).iloc[-2]
-    prev = df_h1.iloc[-2]
-    last = df_h1.iloc[-1]
-
-    h = last["datetime"].hour
-    if not (7 <= h < 20):
-        STATS["setup_c_session"] += 1
+    ax = adx(df_h4, 14).iloc[-1]
+    if pd.isna(ax) or ax < 15:
+        STATS["setup_b_adx_low"] += 1
         return None
 
-    touch_buy = up and prev["low"] <= ema50 * 1.002
-    touch_sell = down and prev["high"] >= ema50 * 0.998
+    # уровень = high/low за 20 свечей до последней закрытой
+    window = df_h4.iloc[-22:-2]
+    if len(window) < 10:
+        STATS["setup_b_no_level"] += 1
+        return None
+    resistance = window["high"].max()
+    support = window["low"].min()
 
-    if not (touch_buy or touch_sell):
-        STATS["setup_c_far_from_ema"] += 1
+    # последняя закрытая свеча H4
+    bar = df_h4.iloc[-2]
+
+    # ложный пробой сопротивления: high > resistance, close < resistance
+    fake_up = bar["high"] > resistance and bar["close"] < resistance
+    # ложный пробой поддержки: low < support, close > support
+    fake_down = bar["low"] < support and bar["close"] > support
+
+    if not (fake_up or fake_down):
+        STATS["setup_b_no_fakeout"] += 1
         return None
 
-    if touch_buy:
-        confirm = last["close"] > last["open"] and last["close"] > prev["high"]
-        if not confirm:
-            STATS["setup_c_no_confirm"] += 1
-            return None
-        sl = max(prev["high"], last["high"]) + 0.2 * a
-        entry = last["close"]
+    if fake_up:
+        # вход SELL на открытии следующей свечи (индекс -1)
+        entry_bar = df_h4.iloc[-1]
+        entry = entry_bar["open"]
+        sl = bar["high"] + 0.3 * a
         risk = sl - entry
         tp = entry - 2.0 * risk
-        return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
+        return {"side": "SELL", "entry": entry, "sl": sl, "tp": tp, "setup": "B"}
 
-    if touch_sell:
-        confirm = last["close"] < last["open"] and last["close"] < prev["low"]
-        if not confirm:
-            STATS["setup_c_no_confirm"] += 1
-            return None
-        sl = min(prev["low"], last["low"]) - 0.2 * a
-        entry = last["close"]
+    if fake_down:
+        entry_bar = df_h4.iloc[-1]
+        entry = entry_bar["open"]
+        sl = bar["low"] - 0.3 * a
         risk = entry - sl
         tp = entry + 2.0 * risk
-        return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "C"}
+        return {"side": "BUY", "entry": entry, "sl": sl, "tp": tp, "setup": "B"}
 
-    STATS["setup_c_weak_wick"] += 1
     return None
 
 
-def simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=300):
-    """Симуляция с учётом издержек."""
+def simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=600):
     risk = (entry - sl) if side == "BUY" else (sl - entry)
     reward = (tp - entry) if side == "BUY" else (entry - tp)
     if risk <= 0 or reward <= 0:
         return None, from_idx
 
-    cost_in_price = TOTAL_COST_RATIO * entry       # издержки в единицах цены
-    cost_in_r = cost_in_price / risk                # издержки в R
+    cost_in_r = (TOTAL_COST_RATIO * entry) / risk
 
     for i in range(from_idx + 1, min(from_idx + 1 + max_bars, len(df_m5))):
         b = df_m5.iloc[i]
@@ -252,42 +167,32 @@ async def run_backtest(symbols, days=90, progress_cb=None):
         if progress_cb:
             await progress_cb(f"📥 [{idx}/{total}] Скачиваю {sym}...")
         df_m5 = await fetch_all(sym, "5m", days)
-        df_m15 = await fetch_all(sym, "15m", days)
-        df_h1 = await fetch_all(sym, "1h", days)
-        df_d1 = await fetch_all(sym, "1d", max(days, 300))
+        df_h4 = await fetch_all(sym, "4h", max(days, 200))
 
-        if df_m5.empty or df_h1.empty:
+        if df_m5.empty or df_h4.empty:
             continue
 
         if progress_cb:
             await progress_cb(
                 f"🔬 [{idx}/{total}] Прогоняю {sym} "
-                f"(M5: {len(df_m5)}, H1: {len(df_h1)}, D1: {len(df_d1)})..."
+                f"(M5: {len(df_m5)}, H4: {len(df_h4)})..."
             )
 
-        trades_per_day = {}   # {date: count}
+        trades_per_day = {}
 
-        for i in range(50, len(df_m5) - 1, 3):
+        for i in range(50, len(df_m5) - 1, 6):
             STATS["total_bars"] += 1
-            win_m5 = df_m5.iloc[:i + 1]
-            cut = win_m5["datetime"].iloc[-1]
-            win_m15 = df_m15[df_m15["datetime"] <= cut].tail(50)
-            win_h1 = df_h1[df_h1["datetime"] <= cut].tail(220)
-            win_d1 = df_d1[df_d1["datetime"] <= cut].tail(200)
-            if len(win_m15) < 30 or len(win_h1) < 220 or len(win_d1) < 200:
+            cut = df_m5["datetime"].iloc[i]
+
+            # берём H4-свечи, закрытые ДО момента cut
+            win_h4 = df_h4[df_h4["datetime"] <= cut].tail(120)
+            if len(win_h4) < 120:
                 continue
 
-            sig = None
-            h = win_m5["datetime"].iloc[-1].hour
-            if 7 <= h < 10:
-                sig = setup_a(win_m5, win_m15)
-            if not sig:
-                sig = setup_c(win_h1, win_d1)
-
+            sig = setup_b(win_h4)
             if not sig:
                 continue
 
-            # лимит сделок в день
             day = cut.date()
             if trades_per_day.get(day, 0) >= MAX_TRADES_PER_DAY_PER_SYMBOL:
                 STATS["daily_limit_skipped"] += 1
@@ -301,7 +206,7 @@ async def run_backtest(symbols, days=90, progress_cb=None):
             trades_per_day[day] = trades_per_day.get(day, 0) + 1
             trades.append({
                 "symbol": sym, "setup": sig["setup"], "side": sig["side"],
-                "r": r, "time": win_m5["datetime"].iloc[-1],
+                "r": r, "time": cut,
             })
 
     return trades
@@ -309,23 +214,14 @@ async def run_backtest(symbols, days=90, progress_cb=None):
 
 def stats_report():
     return (
-        "🔍 <b>ВОРОНКА ОТСЕВА</b>\n"
+        "🔍 <b>ВОРОНКА ОТСЕВА — СЕТАП B</b>\n"
         f"Всего проверок: {STATS['total_bars']}\n"
         f"Отсечено лимитом дня: {STATS['daily_limit_skipped']}\n\n"
-        f"<b>Сетап A</b> (проверок: {STATS['setup_a_checked']}):\n"
-        f"  нет азиатского диапазона: {STATS['setup_a_asia_missing']}\n"
-        f"  диапазон больше 5%: {STATS['setup_a_range_wide']}\n"
-        f"  нет пробоя: {STATS['setup_a_no_break']}\n"
-        f"  нет ретеста: {STATS['setup_a_no_retest']}\n"
-        f"  слабый объём: {STATS['setup_a_low_volume']}\n"
-        f"  RSI блок: {STATS['setup_a_rsi_block']}\n\n"
-        f"<b>Сетап C (ИНВЕРТИРОВАННЫЙ)</b> (проверок: {STATS['setup_c_checked']}):\n"
-        f"  ADX меньше 25: {STATS['setup_c_adx_low']}\n"
-        f"  нет тренда: {STATS['setup_c_no_trend']}\n"
-        f"  ATR вне коридора: {STATS['setup_c_atr']}\n"
-        f"  вне сессии: {STATS['setup_c_session']}\n"
-        f"  далеко от EMA50: {STATS['setup_c_far_from_ema']}\n"
-        f"  нет подтверждения: {STATS['setup_c_no_confirm']}\n\n"
+        f"<b>Сетап B</b> (проверок: {STATS['setup_b_checked']}):\n"
+        f"  ATR вне коридора: {STATS['setup_b_atr_out']}\n"
+        f"  ADX меньше 15: {STATS['setup_b_adx_low']}\n"
+        f"  нет уровня: {STATS['setup_b_no_level']}\n"
+        f"  нет ложного пробоя: {STATS['setup_b_no_fakeout']}\n\n"
         f"<b>Найдено сигналов:</b> {STATS['signals']}\n"
         f"<b>Сделок:</b> {STATS['simulated']}"
     )
