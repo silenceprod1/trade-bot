@@ -6,7 +6,6 @@ from datetime import datetime, timedelta, timezone
 
 exchange = ccxt.binance({"enableRateLimit": True})
 
-# счётчики отсева
 STATS = {
     "total_bars": 0,
     "setup_a_checked": 0,
@@ -254,17 +253,17 @@ async def run_backtest(symbols, days=90, progress_cb=None):
 
 def stats_report():
     return (
-        "<b>🔍 ВОРОНКА ОТСЕВА</b>\n"
+        "🔍 <b>ВОРОНКА ОТСЕВА</b>\n"
         f"Всего проверок: {STATS['total_bars']}\n\n"
-        f"<b>Сетап A</b> (всего {STATS['setup_a_checked']}):\n"
+        f"<b>Сетап A</b> (проверок: {STATS['setup_a_checked']}):\n"
         f"  нет азиатского диапазона: {STATS['setup_a_asia_missing']}\n"
-        f"  диапазон > 5%: {STATS['setup_a_range_wide']}\n"
+        f"  диапазон больше 5%: {STATS['setup_a_range_wide']}\n"
         f"  нет пробоя: {STATS['setup_a_no_break']}\n"
         f"  нет ретеста: {STATS['setup_a_no_retest']}\n"
         f"  слабый объём: {STATS['setup_a_low_volume']}\n"
         f"  RSI блок: {STATS['setup_a_rsi_block']}\n\n"
-        f"<b>Сетап C</b> (всего {STATS['setup_c_checked']}):\n"
-        f"  ADX < 15: {STATS['setup_c_adx_low']}\n"
+        f"<b>Сетап C</b> (проверок: {STATS['setup_c_checked']}):\n"
+        f"  ADX меньше 15: {STATS['setup_c_adx_low']}\n"
         f"  далеко от EMA50: {STATS['setup_c_far_from_ema']}\n"
         f"  слабый пин-бар: {STATS['setup_c_weak_wick']}\n\n"
         f"<b>Найдено сигналов:</b> {STATS['signals']}\n"
