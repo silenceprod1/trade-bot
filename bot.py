@@ -12,6 +12,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from config import TG_TOKEN, TG_CHAT_ID, SYMBOLS, SCAN_INTERVAL_MIN, MAX_SIGNALS_PER_DAY
 from data import fetch
 from setups import setup_a_asia_breakout, setup_c_trend_pullback, Signal
+from indicators import snapshot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -91,7 +92,8 @@ async def cmd_start(m: Message):
     await m.answer(
         "👋 <b>Trade Signals Bot</b>\n\n"
         "Команды:\n"
-        "/scan — просканировать рынок сейчас\n"
+        "/scan — просканировать рынок\n"
+        "/debug — показать данные по символам\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
         "/test — тестовый сигнал"
@@ -104,6 +106,61 @@ async def cmd_scan(m: Message):
     sigs = await scan_market(manual=True, notify_chat_id=m.chat.id)
     if not sigs:
         await m.answer("Сигналов нет. Рынок либо спит, либо не по правилам.")
+
+
+@dp.message(Command("debug"))
+async def cmd_debug(m: Message):
+    await m.answer("🔎 Собираю данные по символам...")
+    lines = ["<b>DEBUG</b>\n"]
+
+    for sym in SYMBOLS:
+        try:
+            df_m5 = await fetch(sym, "5m", 300)
+            df_m15 = await fetch(sym, "15m", 300)
+            df_h1 = await fetch(sym, "1h", 500)
+            df_d1 = await fetch(sym, "1d", 300)
+        except Exception as e:
+            lines.append(f"❌ <b>{sym}</b>: ошибка fetch — <code>{e}</code>")
+            continue
+
+        if df_m5.empty or df_h1.empty:
+            lines.append(f"❌ <b>{sym}</b>: пустые свечи (Binance не отдал данные)")
+            continue
+
+        snap_m5 = snapshot(df_m5)
+        snap_h1 = snapshot(df_h1)
+        snap_d1 = snapshot(df_d1) if not df_d1.empty else {}
+
+        try:
+            sig_a = setup_a_asia_breakout(sym, df_m5, df_m15)
+        except Exception as e:
+            sig_a = f"ошибка: {e}"
+        try:
+            sig_c = setup_c_trend_pullback(sym, df_h1, df_d1)
+        except Exception as e:
+            sig_c = f"ошибка: {e}"
+
+        a_text = f"✅ {sig_a.side}" if hasattr(sig_a, "side") else f"— {sig_a}"
+        c_text = f"✅ {sig_c.side}" if hasattr(sig_c, "side") else f"— {sig_c}"
+
+        block = (
+            f"\n📊 <b>{sym}</b>\n"
+            f"   свечей M5: {len(df_m5)}, H1: {len(df_h1)}, D1: {len(df_d1)}\n"
+            f"   M5 close: <code>{snap_m5.get('last_close', 0):.4f}</code> "
+            f"RSI: <code>{snap_m5.get('rsi14', 0):.1f}</code>\n"
+            f"   H1 EMA50: <code>{snap_h1.get('ema50', 0):.4f}</code> "
+            f"EMA200: <code>{snap_h1.get('ema200', 0):.4f}</code>\n"
+            f"   H1 ADX: <code>{snap_h1.get('adx14', 0):.1f}</code> "
+            f"ATR: <code>{snap_h1.get('atr14', 0):.4f}</code>\n"
+            f"   D1 close: <code>{snap_d1.get('last_close', 0):.4f}</code>\n"
+            f"   Сетап A: {a_text}\n"
+            f"   Сетап C: {c_text}\n"
+        )
+        lines.append(block)
+
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await m.answer(text[i:i + 3500])
 
 
 @dp.message(Command("status"))
@@ -129,7 +186,7 @@ async def cmd_test(m: Message):
 
 @dp.message(F.text)
 async def echo(m: Message):
-    await m.answer("Используй /scan или /start.")
+    await m.answer("Используй /scan, /debug или /start.")
 
 
 async def main():
