@@ -12,11 +12,15 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import TG_TOKEN, TG_CHAT_ID, SYMBOLS, SCAN_INTERVAL_MIN, MAX_SIGNALS_PER_DAY
-from data import fetch, fetch_candles, close_exchange
-from levels import get_major_levels
-from fvgs import get_fvgs
-from trademind import analyze, generate_neurobro_report, STRATEGY_VERSION
-from backtest_tm import run_backtest_tm, stats_report_tm
+from data import fetch, fetch_candles, fetch_history, fetch_candles_history, close_exchange
+from levels import get_major_levels, build_major_levels
+from fvgs import get_fvgs, build_fvgs
+from trademind import (
+    analyze, generate_neurobro_report, STRATEGY_VERSION,
+    detect_5m_ilm, confirmation_15m, find_sweep,
+    get_config, measure_trend_activity, _levels_for_dir,
+    _level_strength, _f, _t, _c, _h, _l, _o, _body, _range, _body_ratio,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -122,8 +126,9 @@ async def cmd_start(m: Message):
         f"👋 <b>TradeMind Bot v{STRATEGY_VERSION}</b>\n\n"
         "Команды:\n"
         "/scan — просканировать 10 монет\n"
-        "/debug — показать stage/score по всем монетам\n"
-        "/backtest — бэктест TradeMind (30 дней, 2 монеты)\n"
+        "/debug — stage/score по всем монетам\n"
+        "/probe — глубокая диагностика одной монеты\n"
+        "/backtest — бэктест 30 дней на 2 монетах\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
         "/test — тестовое сообщение"
@@ -135,7 +140,7 @@ async def cmd_scan(m: Message):
     await m.answer("🔍 Сканирую 10 монет...")
     sigs = await scan_market(manual=True, notify_chat_id=m.chat.id)
     if not sigs:
-        await m.answer("Сигналов READY нет. Рынок не даёт сетапов.")
+        await m.answer("Сигналов READY нет.")
 
 
 @dp.message(Command("debug"))
@@ -187,19 +192,112 @@ async def cmd_debug(m: Message):
         await m.answer(text[i:i + 3500])
 
 
+@dp.message(Command("probe"))
+async def cmd_probe(m: Message):
+    """Глубокая диагностика: проходит по пайплайну и говорит, где обрыв."""
+    parts = m.text.split()
+    sym_code = parts[1].upper() if len(parts) > 1 else "XRPUSDT"
+
+    sym = sym_code.replace("USDT", "/USDT") if "/" not in sym_code else sym_code
+    if sym not in SYMBOLS:
+        await m.answer(f"❌ {sym_code} нет в SYMBOLS. Доступные: " + ", ".join(_sym_to_code(s) for s in SYMBOLS))
+        return
+
+    await m.answer(f"🔬 Глубокая диагностика {sym_code}...")
+
+    # грузим историю как в бэктесте, чтобы пройти все стадии
+    try:
+        c1h = await fetch_candles_history(sym, "1h", 30)
+        c15 = await fetch_candles_history(sym, "15m", 30)
+        c5 = await fetch_candles_history(sym, "5m", 30)
+        df_m5 = await fetch_history(sym, "5m", 30)
+    except Exception as e:
+        await m.answer(f"❌ fetch error: {e}")
+        return
+
+    if not c1h or not c15 or not c5:
+        await m.answer("❌ нет данных")
+        return
+
+    # срез на последнюю свечу
+    if df_m5.empty:
+        await m.answer("❌ df_m5 пуст")
+        return
+
+    cut_ts = int(df_m5.iloc[-1]["timestamp"])
+    c1h = [x for x in c1h if x["open_time"] <= cut_ts]
+    c15 = [x for x in c15 if x["open_time"] <= cut_ts]
+    c5 = [x for x in c5 if x["open_time"] <= cut_ts]
+
+    if len(c1h) < 50 or len(c15) < 30 or len(c5) < 30:
+        await m.answer(f"❌ мало данных: h1={len(c1h)}, m15={len(c15)}, m5={len(c5)}")
+        return
+
+    price = float(df_m5.iloc[-1]["close"])
+    levels = build_major_levels(c1h, lookback=300, max_levels=20)
+    fvgs = build_fvgs(c15, lookback=150)
+
+    lines = [f"<b>PROBE {sym_code}</b>", f"price: <code>{price:.4f}</code>",
+             f"h1: {len(c1h)} | m15: {len(c15)} | m5: {len(c5)}",
+             f"levels: {len(levels)} | fvgs: {len(fvgs)}\n"]
+
+    for direction in ("LONG", "SHORT"):
+        lines.append(f"<b>=== {direction} ===</b>")
+
+        lv = _levels_for_dir(levels, direction)
+        if not lv:
+            lines.append("  ❌ нет уровней")
+            continue
+
+        strong_lv = [x for x in lv if _level_strength(x) >= 70]
+        if not strong_lv:
+            lines.append(f"  ❌ сильных уровней нет ({len(lv)} слабых)")
+            continue
+        lines.append(f"  ✅ уровней: {len(strong_lv)}")
+
+        sweep = find_sweep(c1h, strong_lv, direction, config=get_config(sym_code))
+        if not sweep:
+            lines.append("  ❌ sweep не найден")
+            continue
+        lines.append(f"  ✅ sweep: level={sweep.get('level')}, extreme={sweep.get('extreme')}, depth={sweep.get('depth_pct'):.3f}%")
+
+        conf_ok, conf_text, conf_t, bos, conf_str = confirmation_15m(c15, sweep, direction)
+        if not conf_ok:
+            lines.append(f"  ❌ 15M confirm не сработал (sweep_time={sweep.get('open_time')})")
+            continue
+        lines.append(f"  ✅ 15M: {conf_text}, bos={bos}, time={conf_t}")
+
+        ilm_ok, ilm = detect_5m_ilm(c5, sweep, direction, conf_t, config=get_config(sym_code))
+        if not ilm_ok:
+            # считаем, сколько M5 свечей после conf_t
+            start = _f(conf_t) or _f(sweep.get("open_time"))
+            after = [c for c in c5 if _t(c) is not None and start is not None and _t(c) > start]
+            tail = after[-60:] if len(after) > 60 else after
+            lines.append(f"  ❌ ILM не найден. M5 после conf_t: {len(after)}, в окне: {len(tail)}")
+            # пробуем посмотреть, есть ли хоть один локальный экстремум с trigger
+            if len(tail) >= 5:
+                lines.append(f"     tail открытие: {_t(tail[0])}, закрытие: {_t(tail[-1])}")
+            continue
+        lines.append(f"  ✅ ILM: {ilm.get('reason')}, rec={ilm.get('recovery_ratio'):.2f}, age={ilm.get('age_candles')}")
+
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await m.answer(text[i:i + 3500])
+
+
 @dp.message(Command("backtest"))
 async def cmd_backtest(m: Message):
     global _backtest_running
     if _backtest_running:
-        await m.answer("⏳ Бэктест уже идёт. Дождись результата.")
+        await m.answer("⏳ Бэктест уже идёт.")
         return
 
     _backtest_running = True
     chat_id = m.chat.id
     await m.answer(
-        "🧪 Запускаю бэктест TradeMind v9.41.\n"
-        "Режим: 30 дней, 2 монеты (XRP, BCH).\n"
-        "Это займёт 3–5 минут. Я пришлю отчёт."
+        "🧪 Бэктест TradeMind v9.41.\n"
+        "30 дней, 2 монеты.\n"
+        "3–7 минут."
     )
 
     async def progress(text):
@@ -254,7 +352,7 @@ async def cmd_test(m: Message):
 
 @dp.message(F.text)
 async def echo(m: Message):
-    await m.answer("Используй /scan, /debug, /backtest или /start.")
+    await m.answer("Используй /scan, /debug, /probe, /backtest или /start.")
 
 
 async def main():
