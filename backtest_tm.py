@@ -1,9 +1,10 @@
 """
-Бэктест TradeMind v9.41 на 90 дней.
-С диагностикой: показывает, сколько свечей скачалось по каждой монете.
+Бэктест TradeMind v9.41 — облегчённая версия (30 дней, 2 монеты по умолчанию).
+Запускать вручную: run_backtest_tm(SYMBOLS[:2], days=30).
 """
 
 import asyncio
+import gc
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ FEE_TAKER = 0.001
 SPREAD = 0.0005
 TOTAL_COST_RATIO = FEE_TAKER * 2 + SPREAD
 
-STEP = 5
+STEP = 15
 MAX_TRADES_PER_DAY_PER_SYMBOL = 3
 
 STATS = {
@@ -57,7 +58,7 @@ def _simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=600):
     return round(0.0 - cost_in_r, 3), from_idx + max_bars
 
 
-async def backtest_symbol(symbol, days=90, progress_cb=None):
+async def backtest_symbol(symbol, days=30, progress_cb=None):
     trades = []
     diag = {"symbol": symbol}
 
@@ -75,21 +76,21 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
         return trades
 
     try:
-        c1h = await fetch_candles(symbol, "1h", int(days * 24 * 2))
+        c1h = await fetch_candles(symbol, "1h", int(days * 24 * 1.5))
         diag["h1_candles"] = len(c1h) if c1h else 0
     except Exception as e:
         diag["h1_error"] = str(e)[:100]
         c1h = []
 
     try:
-        c15 = await fetch_candles(symbol, "15m", int(days * 24 * 4))
+        c15 = await fetch_candles(symbol, "15m", int(days * 24 * 2))
         diag["m15_candles"] = len(c15) if c15 else 0
     except Exception as e:
         diag["m15_error"] = str(e)[:100]
         c15 = []
 
     try:
-        c5_full = await fetch_candles(symbol, "5m", int(days * 24 * 12))
+        c5_full = await fetch_candles(symbol, "5m", int(days * 24 * 4))
         diag["m5_candles"] = len(c5_full) if c5_full else 0
     except Exception as e:
         diag["m5_candles_error"] = str(e)[:100]
@@ -100,10 +101,10 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
         STATS["diagnostics"].append(diag)
         return trades
 
-    diag["iteration_start"] = f"range(200, {len(df_m5) - 1}, {STEP})"
     diag["iteration_count"] = max(0, (len(df_m5) - 1 - 200) // STEP)
 
     levels_cache = {}
+    last_day = None
     trades_per_day = {}
 
     for i in range(200, len(df_m5) - 1, STEP):
@@ -112,6 +113,12 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
         cut_ts = int(row["timestamp"])
         cut_dt = datetime.fromtimestamp(cut_ts / 1000, tz=timezone.utc)
         day = cut_dt.date()
+
+        # очистка кэша раз в день
+        if last_day != day:
+            levels_cache.clear()
+            gc.collect()
+            last_day = day
 
         c1h_sliced = _slice(c1h, cut_ts)[-500:]
         c15_sliced = _slice(c15, cut_ts)[-300:]
@@ -140,7 +147,7 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
                 symbol=symbol.replace("/", "").upper(),
             )
             STATS["analyze_calls"] += 1
-        except Exception as e:
+        except Exception:
             STATS["by_stage"]["ANALYZE_ERROR"] = STATS["by_stage"].get("ANALYZE_ERROR", 0) + 1
             continue
 
@@ -185,13 +192,13 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
     return trades
 
 
-async def run_backtest_tm(symbols, days=90, progress_cb=None):
+async def run_backtest_tm(symbols, days=30, progress_cb=None):
     all_trades = []
     total = len(symbols)
 
     for idx, sym in enumerate(symbols, 1):
         if progress_cb:
-            await progress_cb(f"📥 [{idx}/{total}] {sym}...")
+            await progress_cb(f"📥 [{idx}/{total}] {sym} (days={days})...")
         try:
             trades = await backtest_symbol(sym, days=days, progress_cb=progress_cb)
             all_trades.extend(trades)
@@ -205,7 +212,7 @@ async def run_backtest_tm(symbols, days=90, progress_cb=None):
 
 
 def stats_report_tm(trades):
-    lines = ["🔬 <b>БЭКТЕСТ TradeMind v9.41 — 90 дней</b>\n"]
+    lines = ["🔬 <b>БЭКТЕСТ TradeMind v9.41</b>\n"]
 
     lines.append("<b>ВОРОНКА:</b>")
     lines.append(f"  всего шагов: {STATS['total_steps']}")
@@ -219,14 +226,10 @@ def stats_report_tm(trades):
             lines.append(f"  {k}: {v}")
 
     if STATS["diagnostics"]:
-        lines.append("\n<b>ДИАГНОСТИКА (первые 5 монет):</b>")
+        lines.append("\n<b>ДИАГНОСТИКА:</b>")
         for d in STATS["diagnostics"][:5]:
             sym = d.get("symbol", "?")
-            parts = []
-            for k, v in d.items():
-                if k == "symbol":
-                    continue
-                parts.append(f"{k}={v}")
+            parts = [f"{k}={v}" for k, v in d.items() if k != "symbol"]
             lines.append(f"  <b>{sym}</b>: " + ", ".join(parts))
 
     if not trades:
