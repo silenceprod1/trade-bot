@@ -27,9 +27,8 @@ from trademind import (
 from ilm_patch import (
     apply_patch as apply_ilm_patch,
     detect_5m_ilm_patched,
-    MIN_BODY_RATIO_TRIGGER_5M_PATCH,
-    CLOSE_BREAK_FRACTION,
-    VSHAPE_TOLERANCE,
+    confirmation_15m_patched,
+    set_cut_ts,
 )
 apply_ilm_patch()
 from backtest_tm import run_backtest_tm, stats_report_tm
@@ -95,6 +94,11 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 
         price, c1h, c15, c5, levels, fvgs = snap
 
+        # реальное время: cut_ts = время последней M5-свечи
+        last_ts = int(c5[-1]["open_time"]) if c5 else None
+        if last_ts:
+            set_cut_ts(last_ts)
+
         try:
             result = analyze(
                 candles_1h=c1h,
@@ -135,9 +139,9 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 @dp.message(CommandStart())
 async def cmd_start(msg: Message):
     await msg.answer(
-        f"👋 <b>TradeMind Bot v{STRATEGY_VERSION}</b>\n\n"
+        f"👋 <b>TradeMind Bot v{STRATEGY_VERSION} (patched)</b>\n\n"
         "Команды:\n"
-        "/scan, /debug, /probe SYMBOL, /probehist SYMBOL DAYS,\n"
+        "/scan, /debug, /probehist SYMBOL DAYS,\n"
         "/backtest, /status, /id, /test"
     )
 
@@ -153,7 +157,7 @@ async def cmd_scan(msg: Message):
 @dp.message(Command("debug"))
 async def cmd_debug(msg: Message):
     await msg.answer("🔎 Собираю данные... ~30 секунд.")
-    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION}</b>\n"]
+    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION} (patched)</b>\n"]
     for sym in SYMBOLS:
         code = _sym_to_code(sym)
         try:
@@ -163,6 +167,9 @@ async def cmd_debug(msg: Message):
         if not snap:
             lines.append(f"❌ {sym}: нет данных"); continue
         price, c1h, c15, c5, levels, fvgs = snap
+        last_ts = int(c5[-1]["open_time"]) if c5 else None
+        if last_ts:
+            set_cut_ts(last_ts)
         try:
             r = analyze(candles_1h=c1h, candles_15m=c15, candles_5m=c5,
                         current_price=price, major_levels=levels,
@@ -176,8 +183,7 @@ async def cmd_debug(msg: Message):
             f"\n📊 <b>{code}</b> | price <code>{price:.4f}</code>\n"
             f"   context: {r.get('context_direction')} | "
             f"stage: <b>{best.get('stage')}</b> | score: <b>{best.get('score')}</b>\n"
-            f"   dir: {best.get('direction')} | "
-            f"conf: {best.get('confirmation')} | bos: {best.get('bos')}\n"
+            f"   dir: {best.get('direction')} | conf: {best.get('confirmation')} | bos: {best.get('bos')}\n"
             f"   reason: {best.get('reason')}\n"
             f"   levels: {len(levels)} | fvgs: {len(fvgs)}"
         )
@@ -196,7 +202,7 @@ async def cmd_probehist(msg: Message):
         await msg.answer(f"❌ {sym_code} нет в SYMBOLS")
         return
 
-    await msg.answer(f"🔬 Глубокая диагностика ILM по {sym_code} за {days} дней...")
+    await msg.answer(f"🔬 Диагностика ILM {sym_code} за {days} дней (patched v3)...")
     try:
         c1h_full = await fetch_candles_history(sym, "1h", days)
         c15_full = await fetch_candles_history(sym, "15m", days)
@@ -207,8 +213,8 @@ async def cmd_probehist(msg: Message):
     if df_m5.empty:
         await msg.answer("❌ df_m5 пуст"); return
 
-    found_cases = []
     ready_found = 0
+    first_case = None
 
     for i in range(200, len(df_m5) - 1, 15):
         row = df_m5.iloc[i]
@@ -225,6 +231,8 @@ async def cmd_probehist(msg: Message):
         levels = build_major_levels(c1h, lookback=300, max_levels=20)
         fvgs = build_fvgs(c15, lookback=150)
 
+        set_cut_ts(cut_ts)
+
         try:
             r = analyze(candles_1h=c1h, candles_15m=c15, candles_5m=c5,
                         current_price=price, major_levels=levels,
@@ -232,226 +240,4 @@ async def cmd_probehist(msg: Message):
         except Exception:
             continue
 
-        if r.get("stage") == "READY":
-            ready_found += 1
-
-        for direction in ("LONG", "SHORT"):
-            side_r = r.get("long" if direction == "LONG" else "short") or {}
-            if side_r.get("stage") not in ("15M_CONFIRMED", "READY"):
-                continue
-            sweep = side_r.get("sweep")
-            conf_t = side_r.get("confirmation_15m_time")
-            if not sweep or not conf_t:
-                continue
-            found_cases.append({
-                "time": cut_dt.isoformat(),
-                "direction": direction,
-                "stage": side_r.get("stage"),
-                "conf_text": side_r.get("confirmation"),
-                "sweep": sweep,
-                "conf_t": conf_t,
-                "c5": c5[:],
-            })
-            if len(found_cases) >= 1:  # только первый случай, чтобы влезло
-                break
-        if len(found_cases) >= 1:
-            break
-
-    lines = [f"<b>DIAG {sym_code} — READY={ready_found}</b>\n"]
-    if not found_cases:
-        await msg.answer("❌ Не нашёл 15M_CONFIRMED.")
-        return
-
-    case = found_cases[0]
-    lines.append(f"<b>{case['time']} {case['direction']} {case['stage']}</b>")
-    lines.append(f"conf={case['conf_text']}")
-
-    sweep = case["sweep"]
-    conf_t = case["conf_t"]
-    c5 = case["c5"]
-    direction = case["direction"]
-
-    lines.append(f"sweep: level={sweep.get('level')}, extreme={sweep.get('extreme')}")
-    lines.append(f"conf_t={conf_t}")
-
-    start = _f(conf_t) or _f(sweep.get("open_time"))
-    after = [c for c in c5 if _t(c) is not None and start is not None and _t(c) > start]
-    tail = after[-MAX_5M_ILM_CANDLES:]
-    lines.append(f"M5 после conf_t: {len(after)}, окно: {len(tail)}\n")
-
-    if len(tail) < 5:
-        lines.append("❌ мало свечей")
-        await msg.answer("\n".join(lines))
-        return
-
-    sl_lvl = _f(sweep.get("level"))
-    config = get_config(sym_code)
-    min_depth = config.get("MIN_SWEEP_DEPTH_PCT", 0.12)
-
-    # Разбираем по каждой i, где есть local extreme
-    counter = 0
-    for i in range(2, len(tail) - 2):
-        mc = tail[i]
-        if direction == "LONG":
-            ml = _l(mc); mh = _h(mc)
-            if ml is None or mh is None:
-                continue
-            before = tail[max(0, i - 2):i]
-            bl = [_l(x) for x in before if _l(x) is not None]
-            if not bl:
-                continue
-            left_ref = min(bl)
-            if left_ref <= ml:
-                continue
-            m_range = left_ref - ml
-            if m_range <= 0:
-                continue
-            m_pct = m_range / left_ref * 100
-            if m_pct < min_depth:
-                continue
-            # нашли local extreme
-            mid_threshold = mh - (mh - ml) * CLOSE_BREAK_FRACTION
-            for j in range(i + 1, min(len(tail), i + 1 + ILM_TRIGGER_WINDOW)):
-                trig = tail[j]
-                tc = _c(trig); to = _o(trig)
-                if tc is None or to is None or not (tc > to):
-                    continue
-                br = _body_ratio(trig)
-                h1 = _h(tail[j - 1]) if j >= 1 else None
-                h2 = _h(tail[j - 2]) if j >= 2 else None
-                vthr = max(h1, h2) * (1 - VSHAPE_TOLERANCE) if h1 is not None and h2 is not None else None
-                counter += 1
-                lines.append(
-                    f"  T{counter}: ml={ml:.4f} mh={mh:.4f} mid={mid_threshold:.4f}\n"
-                    f"     tc={tc:.4f} to={to:.4f} body={br:.2f}\n"
-                    f"     vthr={vthr} (max2h)\n"
-                    f"     body>=0.35? {br >= MIN_BODY_RATIO_TRIGGER_5M_PATCH}\n"
-                    f"     vshape? {vthr is not None and tc > vthr}\n"
-                    f"     close>=mid? {tc >= mid_threshold}"
-                )
-                if counter >= 5:
-                    break
-            if counter >= 5:
-                break
-        else:
-            mh = _h(mc); ml = _l(mc)
-            if mh is None or ml is None:
-                continue
-            before = tail[max(0, i - 2):i]
-            bh = [_h(x) for x in before if _h(x) is not None]
-            if not bh:
-                continue
-            left_ref = max(bh)
-            if mh <= left_ref:
-                continue
-            m_range = mh - left_ref
-            if m_range <= 0:
-                continue
-            m_pct = m_range / mh * 100
-            if m_pct < min_depth:
-                continue
-            mid_threshold = ml + (mh - ml) * CLOSE_BREAK_FRACTION
-            for j in range(i + 1, min(len(tail), i + 1 + ILM_TRIGGER_WINDOW)):
-                trig = tail[j]
-                tc = _c(trig); to = _o(trig)
-                if tc is None or to is None or not (tc < to):
-                    continue
-                br = _body_ratio(trig)
-                l1 = _l(tail[j - 1]) if j >= 1 else None
-                l2 = _l(tail[j - 2]) if j >= 2 else None
-                vthr = min(l1, l2) * (1 + VSHAPE_TOLERANCE) if l1 is not None and l2 is not None else None
-                counter += 1
-                lines.append(
-                    f"  T{counter}: mh={mh:.4f} ml={ml:.4f} mid={mid_threshold:.4f}\n"
-                    f"     tc={tc:.4f} to={to:.4f} body={br:.2f}\n"
-                    f"     vthr={vthr} (min2l)\n"
-                    f"     body>=0.35? {br >= MIN_BODY_RATIO_TRIGGER_5M_PATCH}\n"
-                    f"     vshape? {vthr is not None and tc < vthr}\n"
-                    f"     close<=mid? {tc <= mid_threshold}"
-                )
-                if counter >= 5:
-                    break
-            if counter >= 5:
-                break
-        if counter >= 5:
-            break
-
-    if counter == 0:
-        lines.append("  ❌ нет ни одного trigger-кандидата вообще")
-
-    text = "\n".join(lines)
-    for i in range(0, len(text), 3500):
-        await msg.answer(text[i:i + 3500])
-
-
-@dp.message(Command("backtest"))
-async def cmd_backtest(msg: Message):
-    global _backtest_running
-    if _backtest_running:
-        await msg.answer("⏳ Бэктест уже идёт.")
-        return
-    _backtest_running = True
-    chat_id = msg.chat.id
-    await msg.answer("🧪 Бэктест TradeMind v9.41 (patched ILM). 30 дней, 2 монеты.")
-
-    async def progress(text):
-        try:
-            await bot.send_message(chat_id, text)
-        except Exception:
-            pass
-
-    async def worker():
-        global _backtest_running
-        try:
-            trades = await run_backtest_tm(SYMBOLS[:2], days=30, progress_cb=progress)
-            report = stats_report_tm(trades)
-            for i in range(0, len(report), 3500):
-                await bot.send_message(chat_id, report[i:i + 3500])
-        except Exception as e:
-            await bot.send_message(chat_id, f"❌ Ошибка: <code>{e}</code>")
-        finally:
-            _backtest_running = False
-
-    asyncio.create_task(worker())
-
-
-@dp.message(Command("status"))
-async def cmd_status(msg: Message):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await msg.answer(f"✅ v{STRATEGY_VERSION} (patched)\n🕒 {now}\n📊 {signals_today}/{MAX_SIGNALS_PER_DAY}")
-
-
-@dp.message(Command("id"))
-async def cmd_id(msg: Message):
-    await msg.answer(f"chat_id: <code>{msg.chat.id}</code>")
-
-
-@dp.message(Command("test"))
-async def cmd_test(msg: Message):
-    fake = {"stage": "READY", "direction": "LONG", "score": 88,
-            "reason": "test", "entry": 1.2345, "sl": 1.2200, "tp": 1.2635}
-    await msg.answer(generate_neurobro_report(fake, "TESTUSDT", risk_pct=1.0))
-
-
-@dp.message(F.text)
-async def echo(msg: Message):
-    await msg.answer("Используй /scan, /debug, /probehist, /backtest.")
-
-
-async def main():
-    log.info(f"Старт TradeMind Bot v{STRATEGY_VERSION} (patched ILM)...")
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(scan_market, "interval", minutes=SCAN_INTERVAL_MIN)
-    scheduler.start()
-    await bot.delete_webhook(drop_pending_updates=True)
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await close_exchange()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Остановлен")
+        if r.get("stage")
