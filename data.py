@@ -1,5 +1,6 @@
 import ccxt.async_support as ccxt
 import pandas as pd
+import time as _time
 from typing import Optional
 
 _exchange: Optional[ccxt.binance] = None
@@ -51,6 +52,7 @@ def _to_strategy_format(df: pd.DataFrame) -> list:
 
 
 async def fetch(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+    """Быстрая функция для /scan и /debug — берёт последние `limit` свечей."""
     ex = get_exchange()
     try:
         ohlcv = await ex.fetch_ohlcv(symbol, TF_MAP[timeframe], limit=limit)
@@ -66,6 +68,55 @@ async def fetch(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
     return df
 
 
+async def fetch_history(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
+    """
+    Качает всю историю за `days` дней пошагово (по 1000 свечей за запрос).
+    Нужна ТОЛЬКО для бэктеста.
+    """
+    ex = get_exchange()
+    tf_ms = ex.parse_timeframe(TF_MAP[timeframe]) * 1000
+    now_ms = ex.milliseconds()
+    since = now_ms - days * 24 * 60 * 60 * 1000
+    all_data = []
+    safety = 0
+
+    while since < now_ms and safety < 200:
+        safety += 1
+        try:
+            batch = await ex.fetch_ohlcv(symbol, TF_MAP[timeframe], since=since, limit=1000)
+        except Exception as e:
+            print(f"fetch_history error {symbol} {timeframe}: {e}")
+            await _sleep(1)
+            continue
+
+        if not batch:
+            break
+
+        all_data.extend(batch)
+        since = batch[-1][0] + tf_ms
+
+        # небольшая пауза для rate limit
+        await _sleep(0.15)
+
+    if not all_data:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
+    df["datetime"] = pd.to_datetime(df["timestamp"], unit="ms")
+    return df
+
+
 async def fetch_candles(symbol: str, timeframe: str, limit: int = 500) -> list:
     df = await fetch(symbol, timeframe, limit)
     return _to_strategy_format(df)
+
+
+async def fetch_candles_history(symbol: str, timeframe: str, days: int) -> list:
+    df = await fetch_history(symbol, timeframe, days)
+    return _to_strategy_format(df)
+
+
+async def _sleep(sec: float):
+    import asyncio
+    await asyncio.sleep(sec)
