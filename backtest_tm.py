@@ -1,5 +1,5 @@
 """
-Бэктест TradeMind v9.41 — с корректной загрузкой истории.
+Бэктест TradeMind v9.41 — с корректной загрузкой истории и диагностикой.
 30 дней, 2 монеты (по умолчанию).
 """
 
@@ -62,7 +62,6 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
     trades = []
     diag = {"symbol": symbol}
 
-    # M5 — нужен для входа и симуляции сделки
     try:
         df_m5 = await fetch_history(symbol, "5m", days)
         diag["m5_rows"] = len(df_m5) if df_m5 is not None else 0
@@ -76,7 +75,6 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
         STATS["diagnostics"].append(diag)
         return trades
 
-    # H1, M15, M5 для стратегии
     try:
         c1h = await fetch_candles_history(symbol, "1h", days)
         diag["h1_candles"] = len(c1h) if c1h else 0
