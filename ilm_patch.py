@@ -1,7 +1,6 @@
 """
 Патч для TradeMind v9.41.
-Ослабляет фильтры ILM, чтобы стратегия доходила до READY.
-Подменяет trademind.detect_5m_ilm на свою версию.
+Ослабляет ILM значительно — допускает закрытие внутри диапазона свечи-манипуляции.
 """
 
 import trademind as tm
@@ -13,10 +12,9 @@ from trademind import (
     MIN_5M_ILM_SWEEP_DISTANCE_PCT, MIN_SWEEP_DEPTH_PCT,
 )
 
-# === ОСЛАБЛЕННЫЕ ПАРАМЕТРЫ ===
-MIN_BODY_RATIO_TRIGGER_5M_PATCH = 0.40       # было 0.55
-CLOSE_TOLERANCE = 0.001                      # 0.1% допуск на пробой экстремума
-VSHAPE_TOLERANCE = 0.001                     # 0.1% допуск на V-shape
+MIN_BODY_RATIO_TRIGGER_5M_PATCH = 0.35       # было 0.55, потом 0.40
+CLOSE_BREAK_FRACTION = 0.30                  # закрытие должно пробить 30% диапазона свечи-манипуляции
+VSHAPE_TOLERANCE = 0.002                     # 0.2% допуск на V-shape
 
 
 def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
@@ -45,6 +43,10 @@ def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
     if m_pct < min_depth:
         return None
 
+    # НОВОЕ: закрытие должно быть выше чем ml + (mh - ml) * 0.3
+    # то есть пробить верхние 70% диапазона свечи-манипуляции
+    mid_threshold = mh - (mh - ml) * CLOSE_BREAK_FRACTION
+
     trig_idx = None
     end = min(len(candles), i + 1 + ILM_TRIGGER_WINDOW)
     for j in range(i + 1, end):
@@ -52,18 +54,17 @@ def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
         tc = _c(trig)
         if tc is None or not (tc > _o(trig)):
             continue
-        # ослабленное тело
         if _body_ratio(trig) < MIN_BODY_RATIO_TRIGGER_5M_PATCH:
             continue
-        # ослабленный V-shape: close должен быть > max(prev 2 high) - 0.1%
+        # ослабленный V-shape
         if j >= 2:
             h1 = _h(candles[j - 1]); h2 = _h(candles[j - 2])
             if h1 is not None and h2 is not None:
                 threshold = max(h1, h2) * (1 - VSHAPE_TOLERANCE)
                 if tc <= threshold:
                     continue
-        # ослабленный пробой экстремума: допуск 0.1% вниз
-        if tc > mh * (1 - CLOSE_TOLERANCE):
+        # ослабленный пробой: close выше 70% диапазона манипуляции
+        if tc >= mid_threshold:
             trig_idx = j
             break
     if trig_idx is None:
@@ -90,7 +91,7 @@ def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
         "extreme": ml,
         "trigger_time": _t(trig),
         "trigger_price": tc,
-        "reason": "5M V-ILM (patched)",
+        "reason": "5M V-ILM (patch v2)",
         "recovery_ratio": rec,
         "manipulation_pct": m_pct,
         "age_candles": len(candles) - 1 - trig_idx,
@@ -123,6 +124,9 @@ def _ilm_short_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
     if m_pct < min_depth:
         return None
 
+    # НОВОЕ: закрытие должно быть ниже чем mh - (mh - ml) * 0.3
+    mid_threshold = ml + (mh - ml) * CLOSE_BREAK_FRACTION
+
     trig_idx = None
     end = min(len(candles), i + 1 + ILM_TRIGGER_WINDOW)
     for j in range(i + 1, end):
@@ -138,7 +142,7 @@ def _ilm_short_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
                 threshold = min(l1, l2) * (1 + VSHAPE_TOLERANCE)
                 if tc >= threshold:
                     continue
-        if tc < ml * (1 + CLOSE_TOLERANCE):
+        if tc <= mid_threshold:
             trig_idx = j
             break
     if trig_idx is None:
@@ -165,7 +169,7 @@ def _ilm_short_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
         "extreme": mh,
         "trigger_time": _t(trig),
         "trigger_price": tc,
-        "reason": "5M L-ILM (patched)",
+        "reason": "5M L-ILM (patch v2)",
         "recovery_ratio": rec,
         "manipulation_pct": m_pct,
         "age_candles": len(candles) - 1 - trig_idx,
@@ -218,8 +222,6 @@ def detect_5m_ilm_patched(candles_5m, sweep, direction, conf_time=None, config=N
 
 
 def apply_patch():
-    """Подменяет trademind.detect_5m_ilm на нашу ослабленную версию."""
     tm.detect_5m_ilm = detect_5m_ilm_patched
-    # плюс подменяем константу тела (на случай, если она читается из tm)
     tm.MIN_BODY_RATIO_TRIGGER_5M = MIN_BODY_RATIO_TRIGGER_5M_PATCH
     return True
