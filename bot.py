@@ -2,6 +2,8 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+import numpy as np
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
@@ -14,6 +16,7 @@ from data import fetch, fetch_candles
 from levels import get_major_levels
 from fvgs import get_fvgs
 from trademind import analyze, generate_neurobro_report, STRATEGY_VERSION
+from backtest_tm import run_backtest_tm, stats_report_tm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -26,11 +29,12 @@ dp = Dispatcher()
 
 signals_today = 0
 last_signal_date = None
-_recent_ready = {}   # {symbol: last_ready_time} — чтобы не спамить одним и тем же
+_recent_ready = {}
+_backtest_running = False
 
 
 def _sym_to_code(symbol: str) -> str:
-    """'XRP/USDT' -> 'XRPUSDT' (формат стратегии)."""
+    """'XRP/USDT' -> 'XRPUSDT'."""
     return symbol.replace("/", "").upper()
 
 
@@ -95,7 +99,6 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
         if stage not in ("READY", "WAIT_PULLBACK"):
             continue
 
-        # анти-спам: один сигнал на символ в 30 минут
         now = datetime.now(timezone.utc)
         last = _recent_ready.get(sym)
         if last and (now - last).total_seconds() < 1800:
@@ -122,6 +125,7 @@ async def cmd_start(m: Message):
         "Команды:\n"
         "/scan — просканировать 10 монет\n"
         "/debug — показать stage/score по всем монетам\n"
+        "/backtest — бэктест TradeMind 90 дней\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
         "/test — тестовое сообщение"
@@ -130,7 +134,7 @@ async def cmd_start(m: Message):
 
 @dp.message(Command("scan"))
 async def cmd_scan(m: Message):
-    await m.answer("🔍 Сканирую 10 монет (XRP, BCH, APT, SUI, INJ, SOL, ADA, AVAX, LINK, ARB)...")
+    await m.answer("🔍 Сканирую 10 монет...")
     sigs = await scan_market(manual=True, notify_chat_id=m.chat.id)
     if not sigs:
         await m.answer("Сигналов READY нет. Рынок не даёт сетапов.")
@@ -138,7 +142,7 @@ async def cmd_scan(m: Message):
 
 @dp.message(Command("debug"))
 async def cmd_debug(m: Message):
-    await m.answer("🔎 Собираю данные по 10 монетам... Это займёт ~30 секунд.")
+    await m.answer("🔎 Собираю данные по 10 монетам... ~30 секунд.")
     lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION}</b>\n"]
 
     for sym in SYMBOLS:
@@ -185,6 +189,42 @@ async def cmd_debug(m: Message):
         await m.answer(text[i:i + 3500])
 
 
+@dp.message(Command("backtest"))
+async def cmd_backtest(m: Message):
+    global _backtest_running
+    if _backtest_running:
+        await m.answer("⏳ Бэктест уже идёт. Дождись результата.")
+        return
+
+    _backtest_running = True
+    chat_id = m.chat.id
+    await m.answer(
+        "🧪 Запускаю бэктест TradeMind v9.41 на 90 дней.\n"
+        "10 монет. Это займёт 20–40 минут.\n"
+        "Я пришлю отчёт, когда закончу. Можешь пользоваться ботом."
+    )
+
+    async def progress(text):
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            pass
+
+    async def worker():
+        global _backtest_running
+        try:
+            trades = await run_backtest_tm(SYMBOLS, days=90, progress_cb=progress)
+            report = stats_report_tm(trades)
+            for i in range(0, len(report), 3500):
+                await bot.send_message(chat_id, report[i:i + 3500])
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ Ошибка бэктеста: <code>{e}</code>")
+        finally:
+            _backtest_running = False
+
+    asyncio.create_task(worker())
+
+
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -216,7 +256,7 @@ async def cmd_test(m: Message):
 
 @dp.message(F.text)
 async def echo(m: Message):
-    await m.answer("Используй /scan, /debug или /start.")
+    await m.answer("Используй /scan, /debug, /backtest или /start.")
 
 
 async def main():
