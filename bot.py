@@ -125,32 +125,32 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 
 
 @dp.message(CommandStart())
-async def cmd_start(m: Message):
-    await m.answer(
+async def cmd_start(msg: Message):
+    await msg.answer(
         f"👋 <b>TradeMind Bot v{STRATEGY_VERSION}</b>\n\n"
         "Команды:\n"
         "/scan — просканировать 10 монет\n"
         "/debug — stage/score по всем монетам\n"
         "/probe XRPUSDT — диагностика последней свечи\n"
-        "/probehist XRPUSDT — найти 15M_CONFIRMED в истории и разобрать ILM\n"
+        "/probehist XRPUSDT 30 — найти 15M_CONFIRMED в истории\n"
         "/backtest — бэктест 30 дней на 2 монетах\n"
         "/status — статус бота\n"
-        "/id — узнать chat_id\n"
+        "/id — chat_id\n"
         "/test — тестовое сообщение"
     )
 
 
 @dp.message(Command("scan"))
-async def cmd_scan(m: Message):
-    await m.answer("🔍 Сканирую 10 монет...")
-    sigs = await scan_market(manual=True, notify_chat_id=m.chat.id)
+async def cmd_scan(msg: Message):
+    await msg.answer("🔍 Сканирую 10 монет...")
+    sigs = await scan_market(manual=True, notify_chat_id=msg.chat.id)
     if not sigs:
-        await m.answer("Сигналов READY нет.")
+        await msg.answer("Сигналов READY нет.")
 
 
 @dp.message(Command("debug"))
-async def cmd_debug(m: Message):
-    await m.answer("🔎 Собираю данные... ~30 секунд.")
+async def cmd_debug(msg: Message):
+    await msg.answer("🔎 Собираю данные... ~30 секунд.")
     lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION}</b>\n"]
     for sym in SYMBOLS:
         code = _sym_to_code(sym)
@@ -182,27 +182,27 @@ async def cmd_debug(m: Message):
         )
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
-        await m.answer(text[i:i + 3500])
+        await msg.answer(text[i:i + 3500])
 
 
 @dp.message(Command("probe"))
-async def cmd_probe(m: Message):
-    parts = m.text.split()
+async def cmd_probe(msg: Message):
+    parts = msg.text.split()
     sym_code = parts[1].upper() if len(parts) > 1 else "XRPUSDT"
     sym = sym_code.replace("USDT", "/USDT") if "/" not in sym_code else sym_code
     if sym not in SYMBOLS:
-        await m.answer(f"❌ {sym_code} нет в SYMBOLS")
+        await msg.answer(f"❌ {sym_code} нет в SYMBOLS")
         return
-    await m.answer(f"🔬 Диагностика {sym_code}...")
+    await msg.answer(f"🔬 Диагностика {sym_code}...")
     try:
         c1h = await fetch_candles_history(sym, "1h", 30)
         c15 = await fetch_candles_history(sym, "15m", 30)
         c5 = await fetch_candles_history(sym, "5m", 30)
         df_m5 = await fetch_history(sym, "5m", 30)
     except Exception as e:
-        await m.answer(f"❌ fetch error: {e}"); return
+        await msg.answer(f"❌ fetch error: {e}"); return
     if not c1h or not c15 or not c5 or df_m5.empty:
-        await m.answer("❌ нет данных"); return
+        await msg.answer("❌ нет данных"); return
     cut_ts = int(df_m5.iloc[-1]["timestamp"])
     c1h = [x for x in c1h if x["open_time"] <= cut_ts]
     c15 = [x for x in c15 if x["open_time"] <= cut_ts]
@@ -239,30 +239,29 @@ async def cmd_probe(m: Message):
         lines.append(f"  ✅ ILM: {ilm.get('reason')}, rec={ilm.get('recovery_ratio'):.2f}")
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
-        await m.answer(text[i:i + 3500])
+        await msg.answer(text[i:i + 3500])
 
 
 @dp.message(Command("probehist"))
-async def cmd_probehist(m: Message):
-    """Ищет первый случай 15M_CONFIRMED в истории и разбирает, почему ILM не сработал."""
-    parts = m.text.split()
+async def cmd_probehist(msg: Message):
+    parts = msg.text.split()
     sym_code = parts[1].upper() if len(parts) > 1 else "XRPUSDT"
     days = int(parts[2]) if len(parts) > 2 else 30
     sym = sym_code.replace("USDT", "/USDT") if "/" not in sym_code else sym_code
     if sym not in SYMBOLS:
-        await m.answer(f"❌ {sym_code} нет в SYMBOLS")
+        await msg.answer(f"❌ {sym_code} нет в SYMBOLS")
         return
 
-    await m.answer(f"🔬 Ищу 15M_CONFIRMED в истории {sym_code} за {days} дней...")
+    await msg.answer(f"🔬 Ищу 15M_CONFIRMED в истории {sym_code} за {days} дней...")
     try:
         c1h_full = await fetch_candles_history(sym, "1h", days)
         c15_full = await fetch_candles_history(sym, "15m", days)
         c5_full = await fetch_candles_history(sym, "5m", days)
         df_m5 = await fetch_history(sym, "5m", days)
     except Exception as e:
-        await m.answer(f"❌ fetch error: {e}"); return
+        await msg.answer(f"❌ fetch error: {e}"); return
     if df_m5.empty:
-        await m.answer("❌ df_m5 пуст"); return
+        await msg.answer("❌ df_m5 пуст"); return
 
     found_cases = []
 
@@ -306,13 +305,13 @@ async def cmd_probehist(m: Message):
                 "c5": c5[:],
                 "stage": side_r.get("stage"),
             })
-            if len(found_cases) >= 3:  # разбираем первые 3 случая
+            if len(found_cases) >= 3:
                 break
         if len(found_cases) >= 3:
             break
 
     if not found_cases:
-        await m.answer("❌ Не нашёл ни одного 15M_CONFIRMED за этот период.")
+        await msg.answer("❌ Не нашёл ни одного 15M_CONFIRMED за этот период.")
         return
 
     lines = [f"<b>PROBEHIST {sym_code} — найдено {len(found_cases)} случаев</b>\n"]
@@ -329,7 +328,6 @@ async def cmd_probehist(m: Message):
         lines.append(f"sweep: level={sweep.get('level')}, extreme={sweep.get('extreme')}")
         lines.append(f"conf_t={conf_t}")
 
-        # разбираем ILM по шагам
         start = _f(conf_t) or _f(sweep.get("open_time"))
         after = [c for c in c5 if _t(c) is not None and start is not None and _t(c) > start]
         tail = after[-MAX_5M_ILM_CANDLES:]
@@ -340,11 +338,9 @@ async def cmd_probehist(m: Message):
             continue
 
         sl_lvl = _f(sweep.get("level"))
-        se = _f(sweep.get("extreme"))
         config = get_config(sym_code)
         min_depth = config.get("MIN_SWEEP_DEPTH_PCT", 0.12)
 
-        # считаем, сколько свечей-кандидатов (локальные экстремумы)
         local_extremes = 0
         has_trigger = 0
         vshape_ok = 0
@@ -353,9 +349,9 @@ async def cmd_probehist(m: Message):
         distance_ok = 0
 
         for i in range(2, len(tail) - 2):
+            mc = tail[i]
             if direction == "LONG":
-                m = tail[i]
-                ml = _l(m); mh = _h(m)
+                ml = _l(mc); mh = _h(mc)
                 if ml is None or mh is None:
                     continue
                 before = tail[max(0, i - 2):i]
@@ -395,8 +391,7 @@ async def cmd_probehist(m: Message):
                             distance_ok += 1
                     break
             else:
-                m = tail[i]
-                mh = _h(m); ml = _l(m)
+                mh = _h(mc); ml = _l(mc)
                 if mh is None or ml is None:
                     continue
                 before = tail[max(0, i - 2):i]
@@ -445,18 +440,18 @@ async def cmd_probehist(m: Message):
 
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
-        await m.answer(text[i:i + 3500])
+        await msg.answer(text[i:i + 3500])
 
 
 @dp.message(Command("backtest"))
-async def cmd_backtest(m: Message):
+async def cmd_backtest(msg: Message):
     global _backtest_running
     if _backtest_running:
-        await m.answer("⏳ Бэктест уже идёт.")
+        await msg.answer("⏳ Бэктест уже идёт.")
         return
     _backtest_running = True
-    chat_id = m.chat.id
-    await m.answer("🧪 Бэктест TradeMind v9.41. 30 дней, 2 монеты. 3–7 минут.")
+    chat_id = msg.chat.id
+    await msg.answer("🧪 Бэктест TradeMind v9.41. 30 дней, 2 монеты. 3–7 минут.")
 
     async def progress(text):
         try:
@@ -480,26 +475,26 @@ async def cmd_backtest(m: Message):
 
 
 @dp.message(Command("status"))
-async def cmd_status(m: Message):
+async def cmd_status(msg: Message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await m.answer(f"✅ v{STRATEGY_VERSION}\n🕒 {now}\n📊 {signals_today}/{MAX_SIGNALS_PER_DAY}")
+    await msg.answer(f"✅ v{STRATEGY_VERSION}\n🕒 {now}\n📊 {signals_today}/{MAX_SIGNALS_PER_DAY}")
 
 
 @dp.message(Command("id"))
-async def cmd_id(m: Message):
-    await m.answer(f"chat_id: <code>{m.chat.id}</code>")
+async def cmd_id(msg: Message):
+    await msg.answer(f"chat_id: <code>{msg.chat.id}</code>")
 
 
 @dp.message(Command("test"))
-async def cmd_test(m: Message):
+async def cmd_test(msg: Message):
     fake = {"stage": "READY", "direction": "LONG", "score": 88,
             "reason": "test", "entry": 1.2345, "sl": 1.2200, "tp": 1.2635}
-    await m.answer(generate_neurobro_report(fake, "TESTUSDT", risk_pct=1.0))
+    await msg.answer(generate_neurobro_report(fake, "TESTUSDT", risk_pct=1.0))
 
 
 @dp.message(F.text)
-async def echo(m: Message):
-    await m.answer("Используй /scan, /debug, /probe, /probehist, /backtest.")
+async def echo(msg: Message):
+    await msg.answer("Используй /scan, /debug, /probe, /probehist, /backtest.")
 
 
 async def main():
