@@ -2,9 +2,6 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-import pandas as pd
-import numpy as np
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
@@ -13,10 +10,10 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import TG_TOKEN, TG_CHAT_ID, SYMBOLS, SCAN_INTERVAL_MIN, MAX_SIGNALS_PER_DAY
-from data import fetch
-from setups import setup_a_asia_breakout, setup_c_trend_pullback, Signal
-from indicators import snapshot
-from backtest import run_backtest, stats_report
+from data import fetch, fetch_candles
+from levels import get_major_levels
+from fvgs import get_fvgs
+from trademind import analyze, generate_neurobro_report, STRATEGY_VERSION
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,19 +26,29 @@ dp = Dispatcher()
 
 signals_today = 0
 last_signal_date = None
-_backtest_running = False
+_recent_ready = {}   # {symbol: last_ready_time} — чтобы не спамить одним и тем же
 
 
-def fmt_signal(sig: Signal) -> str:
-    arrow = "🟢" if sig.side == "BUY" else "🔴"
-    return (
-        f"{arrow} <b>{sig.setup}</b> | {sig.symbol}\n"
-        f"Направление: <b>{sig.side}</b>\n"
-        f"Вход: <code>{sig.entry:.5f}</code>\n"
-        f"SL: <code>{sig.sl:.5f}</code>\n"
-        f"TP: <code>{sig.tp:.5f}</code>\n"
-        f"Причина: {sig.reason}"
-    )
+def _sym_to_code(symbol: str) -> str:
+    """'XRP/USDT' -> 'XRPUSDT' (формат стратегии)."""
+    return symbol.replace("/", "").upper()
+
+
+async def build_snapshot(symbol: str):
+    """Возвращает (price, c1h, c15, c5, levels, fvgs) либо None."""
+    df_m5 = await fetch(symbol, "5m", 300)
+    c1h = await fetch_candles(symbol, "1h", 500)
+    c15 = await fetch_candles(symbol, "15m", 300)
+    c5 = await fetch_candles(symbol, "5m", 300)
+
+    if not c1h or not c15 or not c5 or df_m5.empty:
+        return None
+
+    price = float(df_m5["close"].iloc[-1])
+    levels = await get_major_levels(symbol)
+    fvgs = await get_fvgs(symbol)
+
+    return price, c1h, c15, c5, levels, fvgs
 
 
 async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
@@ -50,40 +57,60 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
     if last_signal_date != today:
         signals_today = 0
         last_signal_date = today
+        _recent_ready.clear()
 
     if not manual and signals_today >= MAX_SIGNALS_PER_DAY:
         return []
 
     found = []
+    target = notify_chat_id or (int(TG_CHAT_ID) if TG_CHAT_ID else None)
+
     for sym in SYMBOLS:
+        code = _sym_to_code(sym)
         try:
-            df_m5 = await fetch(sym, "5m", 300)
-            df_m15 = await fetch(sym, "15m", 300)
-            df_h1 = await fetch(sym, "1h", 500)
-            df_d1 = await fetch(sym, "1d", 300)
+            snap = await build_snapshot(sym)
         except Exception as e:
-            log.warning(f"{sym} fetch error: {e}")
+            log.warning(f"{sym} snapshot error: {e}")
+            continue
+        if not snap:
             continue
 
-        if df_m5.empty or df_m15.empty or df_h1.empty or df_d1.empty:
+        price, c1h, c15, c5, levels, fvgs = snap
+
+        try:
+            result = analyze(
+                candles_1h=c1h,
+                candles_15m=c15,
+                candles_5m=c5,
+                current_price=price,
+                major_levels=levels,
+                fvgs=fvgs,
+                symbol=code,
+            )
+        except Exception as e:
+            log.warning(f"{sym} analyze error: {e}")
             continue
 
+        stage = result.get("stage", "WAIT")
+        if stage not in ("READY", "WAIT_PULLBACK"):
+            continue
+
+        # анти-спам: один сигнал на символ в 30 минут
         now = datetime.now(timezone.utc)
-        sig = None
-        if 7 <= now.hour < 10:
-            sig = setup_a_asia_breakout(sym, df_m5, df_m15)
-        if not sig:
-            sig = setup_c_trend_pullback(sym, df_h1, df_d1)
+        last = _recent_ready.get(sym)
+        if last and (now - last).total_seconds() < 1800:
+            continue
+        _recent_ready[sym] = now
 
-        if sig:
-            found.append(sig)
-            signals_today += 1
-            target = notify_chat_id or (int(TG_CHAT_ID) if TG_CHAT_ID else None)
-            if target:
-                try:
-                    await bot.send_message(target, fmt_signal(sig))
-                except Exception as e:
-                    log.warning(f"send error: {e}")
+        found.append(result)
+        signals_today += 1
+
+        if target:
+            try:
+                text = generate_neurobro_report(result, code, risk_pct=1.0)
+                await bot.send_message(target, text)
+            except Exception as e:
+                log.warning(f"send error: {e}")
 
     return found
 
@@ -91,138 +118,78 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
     await m.answer(
-        "👋 <b>Trade Signals Bot</b>\n\n"
+        f"👋 <b>TradeMind Bot v{STRATEGY_VERSION}</b>\n\n"
         "Команды:\n"
-        "/scan — просканировать рынок\n"
-        "/debug — данные по символам\n"
-        "/backtest — диагностика 5 гипотез (90 дней)\n"
+        "/scan — просканировать 10 монет\n"
+        "/debug — показать stage/score по всем монетам\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
-        "/test — тестовый сигнал"
+        "/test — тестовое сообщение"
     )
 
 
 @dp.message(Command("scan"))
 async def cmd_scan(m: Message):
-    await m.answer("🔍 Сканирую рынок...")
+    await m.answer("🔍 Сканирую 10 монет (XRP, BCH, APT, SUI, INJ, SOL, ADA, AVAX, LINK, ARB)...")
     sigs = await scan_market(manual=True, notify_chat_id=m.chat.id)
     if not sigs:
-        await m.answer("Сигналов нет. Рынок либо спит, либо не по правилам.")
+        await m.answer("Сигналов READY нет. Рынок не даёт сетапов.")
 
 
 @dp.message(Command("debug"))
 async def cmd_debug(m: Message):
-    await m.answer("🔎 Собираю данные по символам...")
-    lines = ["<b>DEBUG</b>\n"]
+    await m.answer("🔎 Собираю данные по 10 монетам... Это займёт ~30 секунд.")
+    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION}</b>\n"]
 
     for sym in SYMBOLS:
+        code = _sym_to_code(sym)
         try:
-            df_m5 = await fetch(sym, "5m", 300)
-            df_m15 = await fetch(sym, "15m", 300)
-            df_h1 = await fetch(sym, "1h", 500)
-            df_d1 = await fetch(sym, "1d", 300)
+            snap = await build_snapshot(sym)
         except Exception as e:
-            lines.append(f"❌ <b>{sym}</b>: ошибка fetch — <code>{e}</code>")
+            lines.append(f"❌ {sym}: snapshot error {e}")
+            continue
+        if not snap:
+            lines.append(f"❌ {sym}: нет данных")
             continue
 
-        if df_m5.empty or df_h1.empty:
-            lines.append(f"❌ <b>{sym}</b>: пустые свечи")
+        price, c1h, c15, c5, levels, fvgs = snap
+
+        try:
+            r = analyze(
+                candles_1h=c1h, candles_15m=c15, candles_5m=c5,
+                current_price=price, major_levels=levels,
+                fvgs=fvgs, symbol=code,
+            )
+        except Exception as e:
+            lines.append(f"❌ {sym}: analyze error {e}")
             continue
 
-        snap_m5 = snapshot(df_m5)
-        snap_h1 = snapshot(df_h1)
-        snap_d1 = snapshot(df_d1) if not df_d1.empty else {}
+        long_r = r.get("long") or {}
+        short_r = r.get("short") or {}
+        best = long_r if long_r.get("score", 0) >= short_r.get("score", 0) else short_r
 
-        try:
-            sig_a = setup_a_asia_breakout(sym, df_m5, df_m15)
-        except Exception as e:
-            sig_a = f"ошибка: {e}"
-        try:
-            sig_c = setup_c_trend_pullback(sym, df_h1, df_d1)
-        except Exception as e:
-            sig_c = f"ошибка: {e}"
-
-        a_text = f"✅ {sig_a.side}" if hasattr(sig_a, "side") else f"— {sig_a}"
-        c_text = f"✅ {sig_c.side}" if hasattr(sig_c, "side") else f"— {sig_c}"
-
-        block = (
-            f"\n📊 <b>{sym}</b>\n"
-            f"   свечей M5: {len(df_m5)}, H1: {len(df_h1)}, D1: {len(df_d1)}\n"
-            f"   M5 close: <code>{snap_m5.get('last_close', 0):.4f}</code> "
-            f"RSI: <code>{snap_m5.get('rsi14', 0):.1f}</code>\n"
-            f"   H1 EMA50: <code>{snap_h1.get('ema50', 0):.4f}</code> "
-            f"EMA200: <code>{snap_h1.get('ema200', 0):.4f}</code>\n"
-            f"   H1 ADX: <code>{snap_h1.get('adx14', 0):.1f}</code> "
-            f"ATR: <code>{snap_h1.get('atr14', 0):.4f}</code>\n"
-            f"   D1 close: <code>{snap_d1.get('last_close', 0):.4f}</code>\n"
-            f"   Сетап A: {a_text}\n"
-            f"   Сетап C: {c_text}\n"
+        lines.append(
+            f"\n📊 <b>{code}</b> | price <code>{price:.4f}</code>\n"
+            f"   context: {r.get('context_direction')} | "
+            f"stage: <b>{best.get('stage')}</b> | score: <b>{best.get('score')}</b>\n"
+            f"   dir: {best.get('direction')} | "
+            f"conf: {best.get('confirmation')} | bos: {best.get('bos')}\n"
+            f"   trend: {best.get('trend_activity')} | "
+            f"fvg_bonus: {best.get('fvg_bonus')}\n"
+            f"   reason: {best.get('reason')}\n"
+            f"   levels: {len(levels)} | fvgs: {len(fvgs)}"
         )
-        lines.append(block)
 
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await m.answer(text[i:i + 3500])
 
 
-@dp.message(Command("backtest"))
-async def cmd_backtest(m: Message):
-    global _backtest_running
-    if _backtest_running:
-        await m.answer("⏳ Бэктест уже идёт. Дождись результата.")
-        return
-
-    _backtest_running = True
-    chat_id = m.chat.id
-    await m.answer(
-        "🧪 Запускаю диагностику 5 гипотез на 90 дней.\n"
-        "Это займёт 10–20 минут. Я пришлю отчёт, когда закончу."
-    )
-
-    async def progress(text):
-        try:
-            await bot.send_message(chat_id, text)
-        except Exception:
-            pass
-
-    async def worker():
-        global _backtest_running
-        try:
-            results = await run_backtest(SYMBOLS, days=90, progress_cb=progress)
-
-            all_trades = []
-            for k, v in results.items():
-                all_trades.extend(v)
-
-            lines = [stats_report(results)]
-
-            if all_trades:
-                r_arr = np.array([t["r"] for t in all_trades])
-                wr = (r_arr > 0).sum() / len(r_arr) * 100
-                avg = r_arr.mean()
-                total = r_arr.sum()
-                lines.append(
-                    f"\n<b>ВСЕГО</b>: {len(all_trades)} сд. | "
-                    f"WR {wr:.1f}% | AvgR {avg:+.3f} | ΣR {total:+.1f}"
-                )
-
-            text = "\n".join(lines)
-            for i in range(0, len(text), 3500):
-                await bot.send_message(chat_id, text[i:i + 3500])
-
-        except Exception as e:
-            await bot.send_message(chat_id, f"❌ Ошибка: <code>{e}</code>")
-        finally:
-            _backtest_running = False
-
-    asyncio.create_task(worker())
-
-
 @dp.message(Command("status"))
 async def cmd_status(m: Message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     await m.answer(
-        f"✅ Работаю\n"
+        f"✅ TradeMind Bot v{STRATEGY_VERSION}\n"
         f"🕒 {now}\n"
         f"📊 Сигналов сегодня: {signals_today}/{MAX_SIGNALS_PER_DAY}"
     )
@@ -235,17 +202,25 @@ async def cmd_id(m: Message):
 
 @dp.message(Command("test"))
 async def cmd_test(m: Message):
-    s = Signal("BTC/USDT", "BUY", 60000, 59000, 63000, "TEST", "проверка")
-    await m.answer(fmt_signal(s))
+    fake_result = {
+        "stage": "READY",
+        "direction": "LONG",
+        "score": 88,
+        "reason": "Sweep→15M BOS→5M ILM. Trend 0.65. RR 2.0. BOS=True.",
+        "entry": 1.2345,
+        "sl": 1.2200,
+        "tp": 1.2635,
+    }
+    await m.answer(generate_neurobro_report(fake_result, "TESTUSDT", risk_pct=1.0))
 
 
 @dp.message(F.text)
 async def echo(m: Message):
-    await m.answer("Используй /scan, /debug или /backtest.")
+    await m.answer("Используй /scan, /debug или /start.")
 
 
 async def main():
-    log.info("Старт бота...")
+    log.info(f"Старт TradeMind Bot v{STRATEGY_VERSION}...")
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(scan_market, "interval", minutes=SCAN_INTERVAL_MIN)
     scheduler.start()
