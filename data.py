@@ -1,10 +1,29 @@
 import ccxt.async_support as ccxt
 import pandas as pd
+from typing import Optional
 
-exchange = ccxt.binance({
-    "enableRateLimit": True,
-    "options": {"defaultType": "spot"},
-})
+_exchange: Optional[ccxt.binance] = None
+
+
+def get_exchange() -> ccxt.binance:
+    global _exchange
+    if _exchange is None:
+        _exchange = ccxt.binance({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+        })
+    return _exchange
+
+
+async def close_exchange():
+    global _exchange
+    if _exchange is not None:
+        try:
+            await _exchange.close()
+        except Exception:
+            pass
+        _exchange = None
+
 
 TF_MAP = {
     "5m": "5m",
@@ -16,7 +35,6 @@ TF_MAP = {
 
 
 def _to_strategy_format(df: pd.DataFrame) -> list:
-    """Превращает DataFrame в список dict-свечей формата стратегии."""
     if df is None or df.empty:
         return []
     candles = []
@@ -33,8 +51,9 @@ def _to_strategy_format(df: pd.DataFrame) -> list:
 
 
 async def fetch(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+    ex = get_exchange()
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, TF_MAP[timeframe], limit=limit)
+        ohlcv = await ex.fetch_ohlcv(symbol, TF_MAP[timeframe], limit=limit)
     except Exception as e:
         print(f"Binance error {symbol} {timeframe}: {e}")
         return pd.DataFrame()
@@ -48,6 +67,5 @@ async def fetch(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
 
 
 async def fetch_candles(symbol: str, timeframe: str, limit: int = 500) -> list:
-    """Возвращает свечи в формате стратегии TradeMind."""
     df = await fetch(symbol, timeframe, limit)
     return _to_strategy_format(df)
