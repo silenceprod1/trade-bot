@@ -1,6 +1,7 @@
 """
-Патч для TradeMind v9.41.
-Ослабляет ILM значительно — допускает закрытие внутри диапазона свечи-манипуляции.
+Патч для TradeMind v9.41 (v3).
+1. Ослабляет ILM (body 0.35, close через 30% диапазона).
+2. Патчит confirmation_15m: игнорирует 15M-свечи, которые ещё не закрылись на момент cut_ts.
 """
 
 import trademind as tm
@@ -10,12 +11,27 @@ from trademind import (
     MAX_5M_ILM_CANDLES, ILM_TRIGGER_WINDOW,
     MIN_5M_RECOVERY_RATIO, MAX_5M_RECOVERY_RATIO,
     MIN_5M_ILM_SWEEP_DISTANCE_PCT, MIN_SWEEP_DEPTH_PCT,
+    MAX_15M_CONFIRM_CANDLES,
 )
 
-MIN_BODY_RATIO_TRIGGER_5M_PATCH = 0.35       # было 0.55, потом 0.40
-CLOSE_BREAK_FRACTION = 0.30                  # закрытие должно пробить 30% диапазона свечи-манипуляции
-VSHAPE_TOLERANCE = 0.002                     # 0.2% допуск на V-shape
+# === ILM ПАРАМЕТРЫ ===
+MIN_BODY_RATIO_TRIGGER_5M_PATCH = 0.35
+CLOSE_BREAK_FRACTION = 0.30
+VSHAPE_TOLERANCE = 0.002
 
+# === ГЛОБАЛЬНЫЙ CUT_TS ===
+# Устанавливается извне (bot.py/backtest_tm.py) перед вызовом analyze()
+_CURRENT_CUT_TS = None
+
+TF_15M_MS = 15 * 60 * 1000
+
+
+def set_cut_ts(cut_ts):
+    global _CURRENT_CUT_TS
+    _CURRENT_CUT_TS = cut_ts
+
+
+# ===================== ILM (из v2) =====================
 
 def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
     mc = candles[i]
@@ -43,10 +59,7 @@ def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
     if m_pct < min_depth:
         return None
 
-    # НОВОЕ: закрытие должно быть выше чем ml + (mh - ml) * 0.3
-    # то есть пробить верхние 70% диапазона свечи-манипуляции
     mid_threshold = mh - (mh - ml) * CLOSE_BREAK_FRACTION
-
     trig_idx = None
     end = min(len(candles), i + 1 + ILM_TRIGGER_WINDOW)
     for j in range(i + 1, end):
@@ -56,20 +69,17 @@ def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
             continue
         if _body_ratio(trig) < MIN_BODY_RATIO_TRIGGER_5M_PATCH:
             continue
-        # ослабленный V-shape
         if j >= 2:
             h1 = _h(candles[j - 1]); h2 = _h(candles[j - 2])
             if h1 is not None and h2 is not None:
                 threshold = max(h1, h2) * (1 - VSHAPE_TOLERANCE)
                 if tc <= threshold:
                     continue
-        # ослабленный пробой: close выше 70% диапазона манипуляции
         if tc >= mid_threshold:
             trig_idx = j
             break
     if trig_idx is None:
         return None
-
     trig = candles[trig_idx]
     tc = _c(trig)
     if tc is None:
@@ -85,15 +95,11 @@ def _ilm_long_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
         lim = sweep_ext * (1 + MIN_5M_ILM_SWEEP_DISTANCE_PCT / 100)
         if ml > lim:
             return None
-
     return {
-        "direction": "LONG",
-        "extreme": ml,
-        "trigger_time": _t(trig),
-        "trigger_price": tc,
-        "reason": "5M V-ILM (patch v2)",
-        "recovery_ratio": rec,
-        "manipulation_pct": m_pct,
+        "direction": "LONG", "extreme": ml,
+        "trigger_time": _t(trig), "trigger_price": tc,
+        "reason": "5M V-ILM (patch v3)",
+        "recovery_ratio": rec, "manipulation_pct": m_pct,
         "age_candles": len(candles) - 1 - trig_idx,
     }
 
@@ -124,9 +130,7 @@ def _ilm_short_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
     if m_pct < min_depth:
         return None
 
-    # НОВОЕ: закрытие должно быть ниже чем mh - (mh - ml) * 0.3
     mid_threshold = ml + (mh - ml) * CLOSE_BREAK_FRACTION
-
     trig_idx = None
     end = min(len(candles), i + 1 + ILM_TRIGGER_WINDOW)
     for j in range(i + 1, end):
@@ -147,7 +151,6 @@ def _ilm_short_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
             break
     if trig_idx is None:
         return None
-
     trig = candles[trig_idx]
     tc = _c(trig)
     if tc is None:
@@ -163,15 +166,11 @@ def _ilm_short_patched(candles, i, sweep_lvl, sweep_ext, min_depth):
         lim = sweep_ext * (1 - MIN_5M_ILM_SWEEP_DISTANCE_PCT / 100)
         if mh < lim:
             return None
-
     return {
-        "direction": "SHORT",
-        "extreme": mh,
-        "trigger_time": _t(trig),
-        "trigger_price": tc,
-        "reason": "5M L-ILM (patch v2)",
-        "recovery_ratio": rec,
-        "manipulation_pct": m_pct,
+        "direction": "SHORT", "extreme": mh,
+        "trigger_time": _t(trig), "trigger_price": tc,
+        "reason": "5M L-ILM (patch v3)",
+        "recovery_ratio": rec, "manipulation_pct": m_pct,
         "age_candles": len(candles) - 1 - trig_idx,
     }
 
@@ -184,7 +183,6 @@ def detect_5m_ilm_patched(candles_5m, sweep, direction, conf_time=None, config=N
         return False, None
     if direction not in ("LONG", "SHORT"):
         return False, None
-
     start = _f(conf_time) or _f(sweep.get("open_time"))
     candles = []
     for c in candles_5m or []:
@@ -196,7 +194,6 @@ def detect_5m_ilm_patched(candles_5m, sweep, direction, conf_time=None, config=N
     candles = candles[-MAX_5M_ILM_CANDLES:]
     if len(candles) < 5:
         return False, None
-
     sl = _f(sweep.get("level"))
     se = _f(sweep.get("extreme"))
     cands = []
@@ -207,10 +204,8 @@ def detect_5m_ilm_patched(candles_5m, sweep, direction, conf_time=None, config=N
             ilm = _ilm_short_patched(candles, i, sl, se, min_depth)
         if ilm:
             cands.append(ilm)
-
     if not cands:
         return False, None
-
     best = None
     best_score = -1e9
     for cand in cands:
@@ -221,7 +216,89 @@ def detect_5m_ilm_patched(candles_5m, sweep, direction, conf_time=None, config=N
     return True, best
 
 
+# ===================== CONFIRMATION 15M (walk-forward) =====================
+
+def confirmation_15m_patched(candles_15m, sweep, direction):
+    """
+    Точная копия confirmation_15m из trademind.py,
+    НО: 15M-свечи, которые ещё не закрылись на момент _CURRENT_CUT_TS, игнорируются.
+    """
+    if not sweep or not candles_15m:
+        return False, None, None, False, 0.0
+    if direction not in ("LONG", "SHORT"):
+        return False, None, None, False, 0.0
+
+    sweep_t = _f(sweep.get("open_time"))
+
+    # фильтруем закрытые 15M-свечи
+    closed = []
+    for c in candles_15m:
+        t = _t(c)
+        if t is None:
+            continue
+        if _CURRENT_CUT_TS is not None and (t + TF_15M_MS) > _CURRENT_CUT_TS:
+            continue  # ещё не закрылась
+        closed.append(c)
+
+    candidates = []
+    for c in closed:
+        t = _t(c)
+        if sweep_t is None:
+            candidates.append(c)
+        elif t is not None and t > sweep_t:
+            candidates.append(c)
+    candidates = candidates[-MAX_15M_CONFIRM_CANDLES:]
+    if len(candidates) < 3:
+        return False, None, None, False, 0.0
+
+    # BOS
+    for i in range(1, len(candidates)):
+        c = candidates[i]
+        br = _body_ratio(c)
+        if br < 0.50:
+            continue
+        close = _c(c)
+        if close is None:
+            continue
+        if direction == "LONG":
+            if not _body(c) or close <= _o(c):
+                continue
+            highs = [_h(candidates[j]) for j in range(i - 1)
+                     if _is_local_high(candidates, j)
+                     and _h(candidates[j]) is not None]
+            if not highs:
+                continue
+            ref = max(highs[-3:])
+            if close > ref:
+                strength = min(1.0, br * 1.2)
+                return True, "15M BOS", _t(c), True, strength
+        else:
+            if close >= _o(c):
+                continue
+            lows = [_l(candidates[j]) for j in range(i - 1)
+                    if _is_local_low(candidates, j)
+                    and _l(candidates[j]) is not None]
+            if not lows:
+                continue
+            ref = min(lows[-3:])
+            if close < ref:
+                strength = min(1.0, br * 1.2)
+                return True, "15M BOS", _t(c), True, strength
+
+    # FVG inversion
+    inv_ok, inv_reason = tm._check_fvg_inversion_15m(
+        candidates, direction, len(candidates) - 1)
+    if inv_ok:
+        last_c = candidates[-1]
+        return True, inv_reason or "15M FVG inv", _t(last_c), False, 0.85
+
+    return False, None, None, False, 0.0
+
+
+# ===================== APPLY =====================
+
 def apply_patch():
     tm.detect_5m_ilm = detect_5m_ilm_patched
+    tm.confirmation_15m = confirmation_15m_patched
     tm.MIN_BODY_RATIO_TRIGGER_5M = MIN_BODY_RATIO_TRIGGER_5M_PATCH
     return True
