@@ -12,7 +12,7 @@ from aiogram.client.default import DefaultBotProperties
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import TG_TOKEN, TG_CHAT_ID, SYMBOLS, SCAN_INTERVAL_MIN, MAX_SIGNALS_PER_DAY
-from data import fetch, fetch_candles
+from data import fetch, fetch_candles, close_exchange
 from levels import get_major_levels
 from fvgs import get_fvgs
 from trademind import analyze, generate_neurobro_report, STRATEGY_VERSION
@@ -34,12 +34,10 @@ _backtest_running = False
 
 
 def _sym_to_code(symbol: str) -> str:
-    """'XRP/USDT' -> 'XRPUSDT'."""
     return symbol.replace("/", "").upper()
 
 
 async def build_snapshot(symbol: str):
-    """Возвращает (price, c1h, c15, c5, levels, fvgs) либо None."""
     df_m5 = await fetch(symbol, "5m", 300)
     c1h = await fetch_candles(symbol, "1h", 500)
     c15 = await fetch_candles(symbol, "15m", 300)
@@ -125,7 +123,7 @@ async def cmd_start(m: Message):
         "Команды:\n"
         "/scan — просканировать 10 монет\n"
         "/debug — показать stage/score по всем монетам\n"
-        "/backtest — бэктест TradeMind 90 дней\n"
+        "/backtest — бэктест TradeMind (30 дней, 2 монеты)\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
         "/test — тестовое сообщение"
@@ -199,9 +197,9 @@ async def cmd_backtest(m: Message):
     _backtest_running = True
     chat_id = m.chat.id
     await m.answer(
-        "🧪 Запускаю бэктест TradeMind v9.41 на 90 дней.\n"
-        "10 монет. Это займёт 20–40 минут.\n"
-        "Я пришлю отчёт, когда закончу. Можешь пользоваться ботом."
+        "🧪 Запускаю бэктест TradeMind v9.41.\n"
+        "Режим: 30 дней, 2 монеты (XRP, BCH).\n"
+        "Это займёт 3–5 минут. Я пришлю отчёт."
     )
 
     async def progress(text):
@@ -213,7 +211,7 @@ async def cmd_backtest(m: Message):
     async def worker():
         global _backtest_running
         try:
-            trades = await run_backtest_tm(SYMBOLS, days=90, progress_cb=progress)
+            trades = await run_backtest_tm(SYMBOLS[:2], days=30, progress_cb=progress)
             report = stats_report_tm(trades)
             for i in range(0, len(report), 3500):
                 await bot.send_message(chat_id, report[i:i + 3500])
@@ -265,7 +263,10 @@ async def main():
     scheduler.add_job(scan_market, "interval", minutes=SCAN_INTERVAL_MIN)
     scheduler.start()
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_exchange()
 
 
 if __name__ == "__main__":
