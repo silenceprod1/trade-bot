@@ -1,3 +1,4 @@
+import asyncio
 import ccxt.async_support as ccxt
 import pandas as pd
 from typing import Optional
@@ -51,6 +52,7 @@ def _to_strategy_format(df: pd.DataFrame) -> list:
 
 
 async def fetch(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+    """Быстрая функция для /scan и /debug — берёт последние `limit` свечей."""
     ex = get_exchange()
     try:
         ohlcv = await ex.fetch_ohlcv(symbol, TF_MAP[timeframe], limit=limit)
@@ -67,6 +69,7 @@ async def fetch(symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
 
 
 async def fetch_history(symbol: str, timeframe: str, days: int) -> pd.DataFrame:
+    """Качает всю историю за `days` дней пошагово (по 1000 свечей за запрос)."""
     ex = get_exchange()
     tf_ms = ex.parse_timeframe(TF_MAP[timeframe]) * 1000
     now_ms = ex.milliseconds()
@@ -107,6 +110,3 @@ async def fetch_candles(symbol: str, timeframe: str, limit: int = 500) -> list:
 async def fetch_candles_history(symbol: str, timeframe: str, days: int) -> list:
     df = await fetch_history(symbol, timeframe, days)
     return _to_strategy_format(df)
-
-
-import asyncio  # нужен для sleep в fetch_history
