@@ -1,6 +1,6 @@
 """
-Бэктест TradeMind v9.41 — облегчённая версия (30 дней, 2 монеты по умолчанию).
-Запускать вручную: run_backtest_tm(SYMBOLS[:2], days=30).
+Бэктест TradeMind v9.41 — с корректной загрузкой истории.
+30 дней, 2 монеты (по умолчанию).
 """
 
 import asyncio
@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 
-from data import fetch, fetch_candles
+from data import fetch_history, fetch_candles_history
 from levels import build_major_levels
 from fvgs import build_fvgs
 from trademind import analyze
@@ -62,8 +62,9 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
     trades = []
     diag = {"symbol": symbol}
 
+    # M5 — нужен для входа и симуляции сделки
     try:
-        df_m5 = await fetch(symbol, "5m", days)
+        df_m5 = await fetch_history(symbol, "5m", days)
         diag["m5_rows"] = len(df_m5) if df_m5 is not None else 0
     except Exception as e:
         diag["m5_error"] = str(e)[:100]
@@ -75,22 +76,23 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
         STATS["diagnostics"].append(diag)
         return trades
 
+    # H1, M15, M5 для стратегии
     try:
-        c1h = await fetch_candles(symbol, "1h", int(days * 24 * 1.5))
+        c1h = await fetch_candles_history(symbol, "1h", days)
         diag["h1_candles"] = len(c1h) if c1h else 0
     except Exception as e:
         diag["h1_error"] = str(e)[:100]
         c1h = []
 
     try:
-        c15 = await fetch_candles(symbol, "15m", int(days * 24 * 2))
+        c15 = await fetch_candles_history(symbol, "15m", days)
         diag["m15_candles"] = len(c15) if c15 else 0
     except Exception as e:
         diag["m15_error"] = str(e)[:100]
         c15 = []
 
     try:
-        c5_full = await fetch_candles(symbol, "5m", int(days * 24 * 4))
+        c5_full = await fetch_candles_history(symbol, "5m", days)
         diag["m5_candles"] = len(c5_full) if c5_full else 0
     except Exception as e:
         diag["m5_candles_error"] = str(e)[:100]
@@ -114,7 +116,6 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
         cut_dt = datetime.fromtimestamp(cut_ts / 1000, tz=timezone.utc)
         day = cut_dt.date()
 
-        # очистка кэша раз в день
         if last_day != day:
             levels_cache.clear()
             gc.collect()
