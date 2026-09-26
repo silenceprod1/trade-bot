@@ -240,4 +240,129 @@ async def cmd_probehist(msg: Message):
         except Exception:
             continue
 
-        if r.get("stage")
+        if r.get("stage") == "READY":
+            ready_found += 1
+
+        if first_case is None:
+            for direction in ("LONG", "SHORT"):
+                side_r = r.get("long" if direction == "LONG" else "short") or {}
+                if side_r.get("stage") not in ("15M_CONFIRMED", "READY"):
+                    continue
+                sweep = side_r.get("sweep")
+                conf_t = side_r.get("confirmation_15m_time")
+                if not sweep or not conf_t:
+                    continue
+                first_case = {
+                    "time": cut_dt.isoformat(),
+                    "direction": direction,
+                    "stage": side_r.get("stage"),
+                    "conf_text": side_r.get("confirmation"),
+                    "sweep": sweep,
+                    "conf_t": conf_t,
+                    "c5": c5[:],
+                }
+                break
+
+    lines = [f"<b>DIAG {sym_code} (patched v3) — READY={ready_found}</b>\n"]
+    if not first_case:
+        lines.append("❌ Не нашёл 15M_CONFIRMED.")
+        await msg.answer("\n".join(lines))
+        return
+
+    case = first_case
+    sweep = case["sweep"]
+    conf_t = case["conf_t"]
+    c5 = case["c5"]
+    direction = case["direction"]
+
+    lines.append(f"<b>{case['time']} {direction} {case['stage']}</b>")
+    lines.append(f"conf={case['conf_text']}")
+
+    start = _f(conf_t) or _f(sweep.get("open_time"))
+    after = [c for c in c5 if _t(c) is not None and start is not None and _t(c) > start]
+    tail = after[-MAX_5M_ILM_CANDLES:]
+    lines.append(f"M5 после conf_t: {len(after)}, окно: {len(tail)}")
+
+    ilm_ok, ilm = detect_5m_ilm_patched(c5, sweep, direction, conf_t, config=get_config(sym_code))
+    if ilm_ok:
+        lines.append(f"✅ ILM найден: rec={ilm.get('recovery_ratio'):.2f}, "
+                     f"manip={ilm.get('manipulation_pct'):.2f}, age={ilm.get('age_candles')}")
+    else:
+        lines.append(f"❌ ILM не найден даже с патчем")
+
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3500):
+        await msg.answer(text[i:i + 3500])
+
+
+@dp.message(Command("backtest"))
+async def cmd_backtest(msg: Message):
+    global _backtest_running
+    if _backtest_running:
+        await msg.answer("⏳ Бэктест уже идёт.")
+        return
+    _backtest_running = True
+    chat_id = msg.chat.id
+    await msg.answer("🧪 Бэктест TradeMind v9.41 (patched v3). 30 дней, 2 монеты.")
+
+    async def progress(text):
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception:
+            pass
+
+    async def worker():
+        global _backtest_running
+        try:
+            trades = await run_backtest_tm(SYMBOLS[:2], days=30, progress_cb=progress)
+            report = stats_report_tm(trades)
+            for i in range(0, len(report), 3500):
+                await bot.send_message(chat_id, report[i:i + 3500])
+        except Exception as e:
+            await bot.send_message(chat_id, f"❌ Ошибка: <code>{e}</code>")
+        finally:
+            _backtest_running = False
+
+    asyncio.create_task(worker())
+
+
+@dp.message(Command("status"))
+async def cmd_status(msg: Message):
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    await msg.answer(f"✅ v{STRATEGY_VERSION} (patched v3)\n🕒 {now}\n📊 {signals_today}/{MAX_SIGNALS_PER_DAY}")
+
+
+@dp.message(Command("id"))
+async def cmd_id(msg: Message):
+    await msg.answer(f"chat_id: <code>{msg.chat.id}</code>")
+
+
+@dp.message(Command("test"))
+async def cmd_test(msg: Message):
+    fake = {"stage": "READY", "direction": "LONG", "score": 88,
+            "reason": "test", "entry": 1.2345, "sl": 1.2200, "tp": 1.2635}
+    await msg.answer(generate_neurobro_report(fake, "TESTUSDT", risk_pct=1.0))
+
+
+@dp.message(F.text)
+async def echo(msg: Message):
+    await msg.answer("Используй /scan, /debug, /probehist, /backtest.")
+
+
+async def main():
+    log.info(f"Старт TradeMind Bot v{STRATEGY_VERSION} (patched v3)...")
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(scan_market, "interval", minutes=SCAN_INTERVAL_MIN)
+    scheduler.start()
+    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_exchange()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Остановлен")
