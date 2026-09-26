@@ -21,6 +21,7 @@ from trademind import (
     get_config, measure_trend_activity, _levels_for_dir,
     _level_strength, _f, _t, _c, _h, _l, _o, _body, _range, _body_ratio,
 )
+from backtest_tm import run_backtest_tm, stats_report_tm
 
 logging.basicConfig(
     level=logging.INFO,
@@ -127,7 +128,7 @@ async def cmd_start(m: Message):
         "Команды:\n"
         "/scan — просканировать 10 монет\n"
         "/debug — stage/score по всем монетам\n"
-        "/probe — глубокая диагностика одной монеты\n"
+        "/probe XRPUSDT — глубокая диагностика монеты\n"
         "/backtest — бэктест 30 дней на 2 монетах\n"
         "/status — статус бота\n"
         "/id — узнать chat_id\n"
@@ -194,7 +195,6 @@ async def cmd_debug(m: Message):
 
 @dp.message(Command("probe"))
 async def cmd_probe(m: Message):
-    """Глубокая диагностика: проходит по пайплайну и говорит, где обрыв."""
     parts = m.text.split()
     sym_code = parts[1].upper() if len(parts) > 1 else "XRPUSDT"
 
@@ -205,7 +205,6 @@ async def cmd_probe(m: Message):
 
     await m.answer(f"🔬 Глубокая диагностика {sym_code}...")
 
-    # грузим историю как в бэктесте, чтобы пройти все стадии
     try:
         c1h = await fetch_candles_history(sym, "1h", 30)
         c15 = await fetch_candles_history(sym, "15m", 30)
@@ -215,13 +214,8 @@ async def cmd_probe(m: Message):
         await m.answer(f"❌ fetch error: {e}")
         return
 
-    if not c1h or not c15 or not c5:
+    if not c1h or not c15 or not c5 or df_m5.empty:
         await m.answer("❌ нет данных")
-        return
-
-    # срез на последнюю свечу
-    if df_m5.empty:
-        await m.answer("❌ df_m5 пуст")
         return
 
     cut_ts = int(df_m5.iloc[-1]["timestamp"])
@@ -269,14 +263,12 @@ async def cmd_probe(m: Message):
 
         ilm_ok, ilm = detect_5m_ilm(c5, sweep, direction, conf_t, config=get_config(sym_code))
         if not ilm_ok:
-            # считаем, сколько M5 свечей после conf_t
             start = _f(conf_t) or _f(sweep.get("open_time"))
             after = [c for c in c5 if _t(c) is not None and start is not None and _t(c) > start]
             tail = after[-60:] if len(after) > 60 else after
             lines.append(f"  ❌ ILM не найден. M5 после conf_t: {len(after)}, в окне: {len(tail)}")
-            # пробуем посмотреть, есть ли хоть один локальный экстремум с trigger
             if len(tail) >= 5:
-                lines.append(f"     tail открытие: {_t(tail[0])}, закрытие: {_t(tail[-1])}")
+                lines.append(f"     tail open: {_t(tail[0])}, close: {_t(tail[-1])}")
             continue
         lines.append(f"  ✅ ILM: {ilm.get('reason')}, rec={ilm.get('recovery_ratio'):.2f}, age={ilm.get('age_candles')}")
 
