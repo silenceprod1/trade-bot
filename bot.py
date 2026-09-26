@@ -94,7 +94,6 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 
         price, c1h, c15, c5, levels, fvgs = snap
 
-        # реальное время: cut_ts = время последней M5-свечи
         last_ts = int(c5[-1]["open_time"]) if c5 else None
         if last_ts:
             set_cut_ts(last_ts)
@@ -139,7 +138,7 @@ async def scan_market(manual: bool = False, notify_chat_id: int | None = None):
 @dp.message(CommandStart())
 async def cmd_start(msg: Message):
     await msg.answer(
-        f"👋 <b>TradeMind Bot v{STRATEGY_VERSION} (patched)</b>\n\n"
+        f"👋 <b>TradeMind Bot v{STRATEGY_VERSION} (patched v4)</b>\n\n"
         "Команды:\n"
         "/scan, /debug, /probehist SYMBOL DAYS,\n"
         "/backtest, /status, /id, /test"
@@ -157,7 +156,7 @@ async def cmd_scan(msg: Message):
 @dp.message(Command("debug"))
 async def cmd_debug(msg: Message):
     await msg.answer("🔎 Собираю данные... ~30 секунд.")
-    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION} (patched)</b>\n"]
+    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION} (patched v4)</b>\n"]
     for sym in SYMBOLS:
         code = _sym_to_code(sym)
         try:
@@ -202,7 +201,7 @@ async def cmd_probehist(msg: Message):
         await msg.answer(f"❌ {sym_code} нет в SYMBOLS")
         return
 
-    await msg.answer(f"🔬 Диагностика ILM {sym_code} за {days} дней (patched v3)...")
+    await msg.answer(f"🔬 Диагностика ILM {sym_code} за {days} дней (patched v4)...")
     try:
         c1h_full = await fetch_candles_history(sym, "1h", days)
         c15_full = await fetch_candles_history(sym, "15m", days)
@@ -263,7 +262,7 @@ async def cmd_probehist(msg: Message):
                 }
                 break
 
-    lines = [f"<b>DIAG {sym_code} (patched v3) — READY={ready_found}</b>\n"]
+    lines = [f"<b>DIAG {sym_code} (patched v4) — READY={ready_found}</b>\n"]
     if not first_case:
         lines.append("❌ Не нашёл 15M_CONFIRMED.")
         await msg.answer("\n".join(lines))
@@ -288,7 +287,7 @@ async def cmd_probehist(msg: Message):
         lines.append(f"✅ ILM найден: rec={ilm.get('recovery_ratio'):.2f}, "
                      f"manip={ilm.get('manipulation_pct'):.2f}, age={ilm.get('age_candles')}")
     else:
-        lines.append(f"❌ ILM не найден даже с патчем")
+        lines.append(f"❌ ILM не найден даже с патчем v4")
 
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
@@ -303,7 +302,7 @@ async def cmd_backtest(msg: Message):
         return
     _backtest_running = True
     chat_id = msg.chat.id
-    await msg.answer("🧪 Бэктест TradeMind v9.41 (patched v3). 30 дней, 2 монеты.")
+    await msg.answer("🧪 Бэктест TradeMind v9.41 (patched v4). 30 дней, 2 монеты.")
 
     async def progress(text):
         try:
@@ -329,7 +328,7 @@ async def cmd_backtest(msg: Message):
 @dp.message(Command("status"))
 async def cmd_status(msg: Message):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    await msg.answer(f"✅ v{STRATEGY_VERSION} (patched v3)\n🕒 {now}\n📊 {signals_today}/{MAX_SIGNALS_PER_DAY}")
+    await msg.answer(f"✅ v{STRATEGY_VERSION} (patched v4)\n🕒 {now}\n📊 {signals_today}/{MAX_SIGNALS_PER_DAY}")
 
 
 @dp.message(Command("id"))
@@ -350,7 +349,23 @@ async def echo(msg: Message):
 
 
 async def main():
-    log.info(f"Старт TradeMind Bot v{STRATEGY_VERSION} (patched v3)...")
+    log.info(f"Старт TradeMind Bot v{STRATEGY_VERSION} (patched v4)...")
+    try:
+        from ilm_patch import (
+            MIN_BODY_RATIO_TRIGGER_5M_PATCH,
+            CLOSE_BREAK_FRACTION,
+            ILM_TRIGGER_WINDOW_PATCH,
+            MIN_5M_RECOVERY_RATIO_PATCH,
+        )
+        log.info(
+            f"ILM PATCH: body={MIN_BODY_RATIO_TRIGGER_5M_PATCH}, "
+            f"close_break={CLOSE_BREAK_FRACTION}, "
+            f"trigger_window={ILM_TRIGGER_WINDOW_PATCH}, "
+            f"recovery_min={MIN_5M_RECOVERY_RATIO_PATCH}"
+        )
+    except Exception as e:
+        log.error(f"ILM patch не загрузился: {e}")
+
     scheduler = AsyncIOScheduler(timezone="UTC")
     scheduler.add_job(scan_market, "interval", minutes=SCAN_INTERVAL_MIN)
     scheduler.start()
