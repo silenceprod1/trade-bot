@@ -24,7 +24,13 @@ from trademind import (
     MIN_5M_RECOVERY_RATIO, MAX_5M_RECOVERY_RATIO,
     MAX_5M_ILM_CANDLES, MIN_5M_ILM_SWEEP_DISTANCE_PCT,
 )
-from ilm_patch import apply_patch as apply_ilm_patch, detect_5m_ilm_patched
+from ilm_patch import (
+    apply_patch as apply_ilm_patch,
+    detect_5m_ilm_patched,
+    MIN_BODY_RATIO_TRIGGER_5M_PATCH,
+    CLOSE_BREAK_FRACTION,
+    VSHAPE_TOLERANCE,
+)
 apply_ilm_patch()
 from backtest_tm import run_backtest_tm, stats_report_tm
 
@@ -131,14 +137,8 @@ async def cmd_start(msg: Message):
     await msg.answer(
         f"👋 <b>TradeMind Bot v{STRATEGY_VERSION}</b>\n\n"
         "Команды:\n"
-        "/scan — просканировать 10 монет\n"
-        "/debug — stage/score по всем монетам\n"
-        "/probe XRPUSDT — диагностика последней свечи\n"
-        "/probehist XRPUSDT 30 — найти 15M_CONFIRMED в истории\n"
-        "/backtest — бэктест 30 дней на 2 монетах\n"
-        "/status — статус бота\n"
-        "/id — chat_id\n"
-        "/test — тестовое сообщение"
+        "/scan, /debug, /probe SYMBOL, /probehist SYMBOL DAYS,\n"
+        "/backtest, /status, /id, /test"
     )
 
 
@@ -153,7 +153,7 @@ async def cmd_scan(msg: Message):
 @dp.message(Command("debug"))
 async def cmd_debug(msg: Message):
     await msg.answer("🔎 Собираю данные... ~30 секунд.")
-    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION} (patched ILM)</b>\n"]
+    lines = [f"<b>DEBUG TradeMind v{STRATEGY_VERSION}</b>\n"]
     for sym in SYMBOLS:
         code = _sym_to_code(sym)
         try:
@@ -178,65 +178,9 @@ async def cmd_debug(msg: Message):
             f"stage: <b>{best.get('stage')}</b> | score: <b>{best.get('score')}</b>\n"
             f"   dir: {best.get('direction')} | "
             f"conf: {best.get('confirmation')} | bos: {best.get('bos')}\n"
-            f"   trend: {best.get('trend_activity')} | fvg_bonus: {best.get('fvg_bonus')}\n"
             f"   reason: {best.get('reason')}\n"
             f"   levels: {len(levels)} | fvgs: {len(fvgs)}"
         )
-    text = "\n".join(lines)
-    for i in range(0, len(text), 3500):
-        await msg.answer(text[i:i + 3500])
-
-
-@dp.message(Command("probe"))
-async def cmd_probe(msg: Message):
-    parts = msg.text.split()
-    sym_code = parts[1].upper() if len(parts) > 1 else "XRPUSDT"
-    sym = sym_code.replace("USDT", "/USDT") if "/" not in sym_code else sym_code
-    if sym not in SYMBOLS:
-        await msg.answer(f"❌ {sym_code} нет в SYMBOLS")
-        return
-    await msg.answer(f"🔬 Диагностика {sym_code}...")
-    try:
-        c1h = await fetch_candles_history(sym, "1h", 30)
-        c15 = await fetch_candles_history(sym, "15m", 30)
-        c5 = await fetch_candles_history(sym, "5m", 30)
-        df_m5 = await fetch_history(sym, "5m", 30)
-    except Exception as e:
-        await msg.answer(f"❌ fetch error: {e}"); return
-    if not c1h or not c15 or not c5 or df_m5.empty:
-        await msg.answer("❌ нет данных"); return
-    cut_ts = int(df_m5.iloc[-1]["timestamp"])
-    c1h = [x for x in c1h if x["open_time"] <= cut_ts]
-    c15 = [x for x in c15 if x["open_time"] <= cut_ts]
-    c5 = [x for x in c5 if x["open_time"] <= cut_ts]
-    price = float(df_m5.iloc[-1]["close"])
-    levels = build_major_levels(c1h, lookback=300, max_levels=20)
-    fvgs = build_fvgs(c15, lookback=150)
-    lines = [f"<b>PROBE {sym_code} (patched)</b>", f"price: <code>{price:.4f}</code>",
-             f"h1: {len(c1h)} | m15: {len(c15)} | m5: {len(c5)}",
-             f"levels: {len(levels)} | fvgs: {len(fvgs)}\n"]
-    for direction in ("LONG", "SHORT"):
-        lines.append(f"<b>=== {direction} ===</b>")
-        lv = _levels_for_dir(levels, direction)
-        if not lv:
-            lines.append("  ❌ нет уровней"); continue
-        strong_lv = [x for x in lv if _level_strength(x) >= 70]
-        if not strong_lv:
-            lines.append(f"  ❌ сильных уровней нет"); continue
-        lines.append(f"  ✅ уровней: {len(strong_lv)}")
-        sweep = find_sweep(c1h, strong_lv, direction, config=get_config(sym_code))
-        if not sweep:
-            lines.append("  ❌ sweep не найден"); continue
-        lines.append(f"  ✅ sweep: level={sweep.get('level')}, extreme={sweep.get('extreme')}")
-        conf_ok, conf_text, conf_t, bos, conf_str = confirmation_15m(c15, sweep, direction)
-        if not conf_ok:
-            lines.append(f"  ❌ 15M не сработал"); continue
-        lines.append(f"  ✅ 15M: {conf_text}, bos={bos}")
-        ilm_ok, ilm = detect_5m_ilm_patched(c5, sweep, direction, conf_t, config=get_config(sym_code))
-        if not ilm_ok:
-            lines.append(f"  ❌ ILM не найден (patched)")
-            continue
-        lines.append(f"  ✅ ILM: {ilm.get('reason')}, rec={ilm.get('recovery_ratio'):.2f}")
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
         await msg.answer(text[i:i + 3500])
@@ -252,7 +196,7 @@ async def cmd_probehist(msg: Message):
         await msg.answer(f"❌ {sym_code} нет в SYMBOLS")
         return
 
-    await msg.answer(f"🔬 Ищу 15M_CONFIRMED в истории {sym_code} за {days} дней (patched ILM)...")
+    await msg.answer(f"🔬 Глубокая диагностика ILM по {sym_code} за {days} дней...")
     try:
         c1h_full = await fetch_candles_history(sym, "1h", days)
         c15_full = await fetch_candles_history(sym, "15m", days)
@@ -308,29 +252,132 @@ async def cmd_probehist(msg: Message):
                 "conf_t": conf_t,
                 "c5": c5[:],
             })
-            if len(found_cases) >= 3:
+            if len(found_cases) >= 1:  # только первый случай, чтобы влезло
                 break
-        if len(found_cases) >= 3:
+        if len(found_cases) >= 1:
             break
 
-    lines = [f"<b>PROBEHIST PATCHED {sym_code} — найдено {len(found_cases)} случаев</b>"]
-    lines.append(f"<b>READY за {days} дней: {ready_found}</b>\n")
+    lines = [f"<b>DIAG {sym_code} — READY={ready_found}</b>\n"]
+    if not found_cases:
+        await msg.answer("❌ Не нашёл 15M_CONFIRMED.")
+        return
 
-    for case in found_cases:
-        lines.append(f"\n<b>=== {case['time']} {case['direction']} ===</b>")
-        lines.append(f"stage={case['stage']} conf={case['conf_text']}")
-        sweep = case["sweep"]
-        conf_t = case["conf_t"]
-        c5 = case["c5"]
-        direction = case["direction"]
-        lines.append(f"sweep: level={sweep.get('level')}, extreme={sweep.get('extreme')}")
+    case = found_cases[0]
+    lines.append(f"<b>{case['time']} {case['direction']} {case['stage']}</b>")
+    lines.append(f"conf={case['conf_text']}")
 
-        ilm_ok, ilm = detect_5m_ilm_patched(c5, sweep, direction, conf_t, config=get_config(sym_code))
-        if ilm_ok:
-            lines.append(f"  ✅ ILM найден: rec={ilm.get('recovery_ratio'):.2f}, "
-                         f"manip={ilm.get('manipulation_pct'):.2f}, age={ilm.get('age_candles')}")
+    sweep = case["sweep"]
+    conf_t = case["conf_t"]
+    c5 = case["c5"]
+    direction = case["direction"]
+
+    lines.append(f"sweep: level={sweep.get('level')}, extreme={sweep.get('extreme')}")
+    lines.append(f"conf_t={conf_t}")
+
+    start = _f(conf_t) or _f(sweep.get("open_time"))
+    after = [c for c in c5 if _t(c) is not None and start is not None and _t(c) > start]
+    tail = after[-MAX_5M_ILM_CANDLES:]
+    lines.append(f"M5 после conf_t: {len(after)}, окно: {len(tail)}\n")
+
+    if len(tail) < 5:
+        lines.append("❌ мало свечей")
+        await msg.answer("\n".join(lines))
+        return
+
+    sl_lvl = _f(sweep.get("level"))
+    config = get_config(sym_code)
+    min_depth = config.get("MIN_SWEEP_DEPTH_PCT", 0.12)
+
+    # Разбираем по каждой i, где есть local extreme
+    counter = 0
+    for i in range(2, len(tail) - 2):
+        mc = tail[i]
+        if direction == "LONG":
+            ml = _l(mc); mh = _h(mc)
+            if ml is None or mh is None:
+                continue
+            before = tail[max(0, i - 2):i]
+            bl = [_l(x) for x in before if _l(x) is not None]
+            if not bl:
+                continue
+            left_ref = min(bl)
+            if left_ref <= ml:
+                continue
+            m_range = left_ref - ml
+            if m_range <= 0:
+                continue
+            m_pct = m_range / left_ref * 100
+            if m_pct < min_depth:
+                continue
+            # нашли local extreme
+            mid_threshold = mh - (mh - ml) * CLOSE_BREAK_FRACTION
+            for j in range(i + 1, min(len(tail), i + 1 + ILM_TRIGGER_WINDOW)):
+                trig = tail[j]
+                tc = _c(trig); to = _o(trig)
+                if tc is None or to is None or not (tc > to):
+                    continue
+                br = _body_ratio(trig)
+                h1 = _h(tail[j - 1]) if j >= 1 else None
+                h2 = _h(tail[j - 2]) if j >= 2 else None
+                vthr = max(h1, h2) * (1 - VSHAPE_TOLERANCE) if h1 is not None and h2 is not None else None
+                counter += 1
+                lines.append(
+                    f"  T{counter}: ml={ml:.4f} mh={mh:.4f} mid={mid_threshold:.4f}\n"
+                    f"     tc={tc:.4f} to={to:.4f} body={br:.2f}\n"
+                    f"     vthr={vthr} (max2h)\n"
+                    f"     body>=0.35? {br >= MIN_BODY_RATIO_TRIGGER_5M_PATCH}\n"
+                    f"     vshape? {vthr is not None and tc > vthr}\n"
+                    f"     close>=mid? {tc >= mid_threshold}"
+                )
+                if counter >= 5:
+                    break
+            if counter >= 5:
+                break
         else:
-            lines.append(f"  ❌ ILM не найден даже с патчем")
+            mh = _h(mc); ml = _l(mc)
+            if mh is None or ml is None:
+                continue
+            before = tail[max(0, i - 2):i]
+            bh = [_h(x) for x in before if _h(x) is not None]
+            if not bh:
+                continue
+            left_ref = max(bh)
+            if mh <= left_ref:
+                continue
+            m_range = mh - left_ref
+            if m_range <= 0:
+                continue
+            m_pct = m_range / mh * 100
+            if m_pct < min_depth:
+                continue
+            mid_threshold = ml + (mh - ml) * CLOSE_BREAK_FRACTION
+            for j in range(i + 1, min(len(tail), i + 1 + ILM_TRIGGER_WINDOW)):
+                trig = tail[j]
+                tc = _c(trig); to = _o(trig)
+                if tc is None or to is None or not (tc < to):
+                    continue
+                br = _body_ratio(trig)
+                l1 = _l(tail[j - 1]) if j >= 1 else None
+                l2 = _l(tail[j - 2]) if j >= 2 else None
+                vthr = min(l1, l2) * (1 + VSHAPE_TOLERANCE) if l1 is not None and l2 is not None else None
+                counter += 1
+                lines.append(
+                    f"  T{counter}: mh={mh:.4f} ml={ml:.4f} mid={mid_threshold:.4f}\n"
+                    f"     tc={tc:.4f} to={to:.4f} body={br:.2f}\n"
+                    f"     vthr={vthr} (min2l)\n"
+                    f"     body>=0.35? {br >= MIN_BODY_RATIO_TRIGGER_5M_PATCH}\n"
+                    f"     vshape? {vthr is not None and tc < vthr}\n"
+                    f"     close<=mid? {tc <= mid_threshold}"
+                )
+                if counter >= 5:
+                    break
+            if counter >= 5:
+                break
+        if counter >= 5:
+            break
+
+    if counter == 0:
+        lines.append("  ❌ нет ни одного trigger-кандидата вообще")
 
     text = "\n".join(lines)
     for i in range(0, len(text), 3500):
@@ -388,7 +435,7 @@ async def cmd_test(msg: Message):
 
 @dp.message(F.text)
 async def echo(msg: Message):
-    await msg.answer("Используй /scan, /debug, /probe, /probehist, /backtest.")
+    await msg.answer("Используй /scan, /debug, /probehist, /backtest.")
 
 
 async def main():
