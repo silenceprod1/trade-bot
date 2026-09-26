@@ -1,6 +1,6 @@
 """
 Бэктест TradeMind v9.41 на 90 дней.
-Прогоняет analyze() на исторических свечах Binance по 10 монетам.
+С диагностикой: показывает, сколько свечей скачалось по каждой монете.
 """
 
 import asyncio
@@ -13,15 +13,11 @@ from levels import build_major_levels
 from fvgs import build_fvgs
 from trademind import analyze
 
-# издержки (доля от цены)
 FEE_TAKER = 0.001
 SPREAD = 0.0005
 TOTAL_COST_RATIO = FEE_TAKER * 2 + SPREAD
 
-# шаг симуляции по M5 (5 свечей = 25 минут)
 STEP = 5
-
-# лимит сделок в день на символ
 MAX_TRADES_PER_DAY_PER_SYMBOL = 3
 
 STATS = {
@@ -30,25 +26,22 @@ STATS = {
     "ready_found": 0,
     "trades": 0,
     "by_stage": {},
+    "diagnostics": [],
 }
 
 
 def _slice(candles, cut_ts):
-    """Оставляет только свечи с open_time <= cut_ts."""
     if not candles:
         return []
     return [c for c in candles if c.get("open_time") is not None and c["open_time"] <= cut_ts]
 
 
 def _simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=600):
-    """Проверяет, что сработало первым: SL или TP. Возвращает R с издержками."""
     risk = (entry - sl) if side == "LONG" else (sl - entry)
     reward = (tp - entry) if side == "LONG" else (entry - tp)
     if risk <= 0 or reward <= 0:
         return None, from_idx
-
     cost_in_r = (TOTAL_COST_RATIO * entry) / risk
-
     for i in range(from_idx + 1, min(from_idx + 1 + max_bars, len(df_m5))):
         b = df_m5.iloc[i]
         if side == "LONG":
@@ -61,28 +54,56 @@ def _simulate(side, entry, sl, tp, df_m5, from_idx, max_bars=600):
                 return round(-1.0 - cost_in_r, 3), i
             if b["low"] <= tp:
                 return round(reward / risk - cost_in_r, 3), i
-
     return round(0.0 - cost_in_r, 3), from_idx + max_bars
 
 
 async def backtest_symbol(symbol, days=90, progress_cb=None):
-    """Возвращает список сделок."""
     trades = []
+    diag = {"symbol": symbol}
 
-    df_m5 = await fetch(symbol, "5m", days)
-    if df_m5.empty:
+    try:
+        df_m5 = await fetch(symbol, "5m", days)
+        diag["m5_rows"] = len(df_m5) if df_m5 is not None else 0
+    except Exception as e:
+        diag["m5_error"] = str(e)[:100]
+        STATS["diagnostics"].append(diag)
         return trades
 
-    c1h = await fetch_candles(symbol, "1h", int(days * 24 * 2))
-    c15 = await fetch_candles(symbol, "15m", int(days * 24 * 4))
-    c5_full = await fetch_candles(symbol, "5m", int(days * 24 * 12))
+    if df_m5 is None or df_m5.empty:
+        diag["m5_error"] = "empty dataframe"
+        STATS["diagnostics"].append(diag)
+        return trades
+
+    try:
+        c1h = await fetch_candles(symbol, "1h", int(days * 24 * 2))
+        diag["h1_candles"] = len(c1h) if c1h else 0
+    except Exception as e:
+        diag["h1_error"] = str(e)[:100]
+        c1h = []
+
+    try:
+        c15 = await fetch_candles(symbol, "15m", int(days * 24 * 4))
+        diag["m15_candles"] = len(c15) if c15 else 0
+    except Exception as e:
+        diag["m15_error"] = str(e)[:100]
+        c15 = []
+
+    try:
+        c5_full = await fetch_candles(symbol, "5m", int(days * 24 * 12))
+        diag["m5_candles"] = len(c5_full) if c5_full else 0
+    except Exception as e:
+        diag["m5_candles_error"] = str(e)[:100]
+        c5_full = []
 
     if not c1h or not c15 or not c5_full:
+        diag["reason"] = "missing candles for strategy"
+        STATS["diagnostics"].append(diag)
         return trades
 
-    # кэш уровней и FVG строим раз в сутки
-    levels_cache = {}
+    diag["iteration_start"] = f"range(200, {len(df_m5) - 1}, {STEP})"
+    diag["iteration_count"] = max(0, (len(df_m5) - 1 - 200) // STEP)
 
+    levels_cache = {}
     trades_per_day = {}
 
     for i in range(200, len(df_m5) - 1, STEP):
@@ -92,7 +113,6 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
         cut_dt = datetime.fromtimestamp(cut_ts / 1000, tz=timezone.utc)
         day = cut_dt.date()
 
-        # срез свечей
         c1h_sliced = _slice(c1h, cut_ts)[-500:]
         c15_sliced = _slice(c15, cut_ts)[-300:]
         c5_sliced = _slice(c5_full, cut_ts)[-300:]
@@ -102,7 +122,6 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
 
         price = float(row["close"])
 
-        # уровни и FVG — кэш по дню + час
         cache_key = (day, cut_dt.hour)
         if cache_key not in levels_cache:
             levels = build_major_levels(c1h_sliced, lookback=300, max_levels=20)
@@ -118,10 +137,11 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
                 current_price=price,
                 major_levels=levels,
                 fvgs=fvgs,
-                symbol=symbol,
+                symbol=symbol.replace("/", "").upper(),
             )
             STATS["analyze_calls"] += 1
-        except Exception:
+        except Exception as e:
+            STATS["by_stage"]["ANALYZE_ERROR"] = STATS["by_stage"].get("ANALYZE_ERROR", 0) + 1
             continue
 
         stage = r.get("stage", "WAIT")
@@ -158,15 +178,10 @@ async def backtest_symbol(symbol, days=90, progress_cb=None):
             "r": rr,
             "time": cut_dt.isoformat(),
             "score": r.get("score"),
-            "reason": r.get("reason", "")[:120],
         })
 
-        if progress_cb and len(trades) % 5 == 0:
-            await progress_cb(
-                f"  {symbol}: {len(trades)} сделок, "
-                f"последняя R={rr:+.2f}"
-            )
-
+    diag["trades_found"] = len(trades)
+    STATS["diagnostics"].append(diag)
     return trades
 
 
@@ -176,7 +191,7 @@ async def run_backtest_tm(symbols, days=90, progress_cb=None):
 
     for idx, sym in enumerate(symbols, 1):
         if progress_cb:
-            await progress_cb(f"📥 [{idx}/{total}] Скачиваю {sym}...")
+            await progress_cb(f"📥 [{idx}/{total}] {sym}...")
         try:
             trades = await backtest_symbol(sym, days=days, progress_cb=progress_cb)
             all_trades.extend(trades)
@@ -184,7 +199,7 @@ async def run_backtest_tm(symbols, days=90, progress_cb=None):
                 await progress_cb(f"✅ [{idx}/{total}] {sym}: {len(trades)} сделок")
         except Exception as e:
             if progress_cb:
-                await progress_cb(f"❌ [{idx}/{total}] {sym}: ошибка — {e}")
+                await progress_cb(f"❌ [{idx}/{total}] {sym}: ошибка — {str(e)[:200]}")
 
     return all_trades
 
@@ -198,9 +213,21 @@ def stats_report_tm(trades):
     lines.append(f"  найдено READY: {STATS['ready_found']}")
     lines.append(f"  симулировано сделок: {STATS['trades']}")
 
-    lines.append("\n<b>СТАДИИ (сколько раз застали):</b>")
-    for k, v in sorted(STATS["by_stage"].items(), key=lambda x: -x[1]):
-        lines.append(f"  {k}: {v}")
+    if STATS["by_stage"]:
+        lines.append("\n<b>СТАДИИ:</b>")
+        for k, v in sorted(STATS["by_stage"].items(), key=lambda x: -x[1]):
+            lines.append(f"  {k}: {v}")
+
+    if STATS["diagnostics"]:
+        lines.append("\n<b>ДИАГНОСТИКА (первые 5 монет):</b>")
+        for d in STATS["diagnostics"][:5]:
+            sym = d.get("symbol", "?")
+            parts = []
+            for k, v in d.items():
+                if k == "symbol":
+                    continue
+                parts.append(f"{k}={v}")
+            lines.append(f"  <b>{sym}</b>: " + ", ".join(parts))
 
     if not trades:
         lines.append("\n❌ Сделок не найдено.")
@@ -228,7 +255,6 @@ def stats_report_tm(trades):
     lines.append(f"\n<b>LONG:</b> {len(longs)} сд. | WR {long_wr:.1f}%")
     lines.append(f"<b>SHORT:</b> {len(shorts)} сд. | WR {short_wr:.1f}%")
 
-    # топ-5 монет
     by_sym = {}
     for t in trades:
         by_sym.setdefault(t["symbol"], []).append(t["r"])
