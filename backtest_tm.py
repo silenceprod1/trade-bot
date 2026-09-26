@@ -1,6 +1,5 @@
 """
-Бэктест TradeMind v9.41 — с корректной загрузкой истории и диагностикой.
-30 дней, 2 монеты (по умолчанию).
+Бэктест TradeMind v9.41 с патчем ILM и walk-forward confirmation.
 """
 
 import asyncio
@@ -13,6 +12,7 @@ from data import fetch_history, fetch_candles_history
 from levels import build_major_levels
 from fvgs import build_fvgs
 from trademind import analyze
+from ilm_patch import set_cut_ts
 
 FEE_TAKER = 0.001
 SPREAD = 0.0005
@@ -71,33 +71,30 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
         return trades
 
     if df_m5 is None or df_m5.empty:
-        diag["m5_error"] = "empty dataframe"
+        diag["m5_error"] = "empty"
         STATS["diagnostics"].append(diag)
         return trades
 
     try:
         c1h = await fetch_candles_history(symbol, "1h", days)
         diag["h1_candles"] = len(c1h) if c1h else 0
-    except Exception as e:
-        diag["h1_error"] = str(e)[:100]
+    except Exception:
         c1h = []
 
     try:
         c15 = await fetch_candles_history(symbol, "15m", days)
         diag["m15_candles"] = len(c15) if c15 else 0
-    except Exception as e:
-        diag["m15_error"] = str(e)[:100]
+    except Exception:
         c15 = []
 
     try:
         c5_full = await fetch_candles_history(symbol, "5m", days)
         diag["m5_candles"] = len(c5_full) if c5_full else 0
-    except Exception as e:
-        diag["m5_candles_error"] = str(e)[:100]
+    except Exception:
         c5_full = []
 
     if not c1h or not c15 or not c5_full:
-        diag["reason"] = "missing candles for strategy"
+        diag["reason"] = "missing candles"
         STATS["diagnostics"].append(diag)
         return trades
 
@@ -135,6 +132,8 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
             levels_cache[cache_key] = (levels, fvgs)
         levels, fvgs = levels_cache[cache_key]
 
+        set_cut_ts(cut_ts)
+
         try:
             r = analyze(
                 candles_1h=c1h_sliced,
@@ -157,14 +156,10 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
             continue
 
         STATS["ready_found"] += 1
-
         if trades_per_day.get(day, 0) >= MAX_TRADES_PER_DAY_PER_SYMBOL:
             continue
 
-        entry = r.get("entry")
-        sl = r.get("sl")
-        tp = r.get("tp")
-        direction = r.get("direction")
+        entry = r.get("entry"); sl = r.get("sl"); tp = r.get("tp"); direction = r.get("direction")
         if not all([entry, sl, tp, direction]):
             continue
 
@@ -176,13 +171,9 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
         trades_per_day[day] = trades_per_day.get(day, 0) + 1
 
         trades.append({
-            "symbol": symbol,
-            "direction": direction,
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "r": rr,
-            "time": cut_dt.isoformat(),
+            "symbol": symbol, "direction": direction,
+            "entry": entry, "sl": sl, "tp": tp,
+            "r": rr, "time": cut_dt.isoformat(),
             "score": r.get("score"),
         })
 
@@ -194,7 +185,6 @@ async def backtest_symbol(symbol, days=30, progress_cb=None):
 async def run_backtest_tm(symbols, days=30, progress_cb=None):
     all_trades = []
     total = len(symbols)
-
     for idx, sym in enumerate(symbols, 1):
         if progress_cb:
             await progress_cb(f"📥 [{idx}/{total}] {sym} (days={days})...")
@@ -206,13 +196,11 @@ async def run_backtest_tm(symbols, days=30, progress_cb=None):
         except Exception as e:
             if progress_cb:
                 await progress_cb(f"❌ [{idx}/{total}] {sym}: ошибка — {str(e)[:200]}")
-
     return all_trades
 
 
 def stats_report_tm(trades):
-    lines = ["🔬 <b>БЭКТЕСТ TradeMind v9.41</b>\n"]
-
+    lines = ["🔬 <b>БЭКТЕСТ TradeMind v9.41 (patched v3)</b>\n"]
     lines.append("<b>ВОРОНКА:</b>")
     lines.append(f"  всего шагов: {STATS['total_steps']}")
     lines.append(f"  вызовов analyze: {STATS['analyze_calls']}")
@@ -252,10 +240,10 @@ def stats_report_tm(trades):
     lines.append(f"  AvgR: <b>{avg:+.3f}</b>")
     lines.append(f"  ΣR: <b>{total_r:+.1f}</b>")
     lines.append(f"  Sharpe: <b>{sharpe:.2f}</b>")
-    lines.append(f"  При риске 1% на сделку: <b>{total_r:+.1f}%</b>")
+    lines.append(f"  При риске 1%: <b>{total_r:+.1f}%</b>")
 
-    lines.append(f"\n<b>LONG:</b> {len(longs)} сд. | WR {long_wr:.1f}%")
-    lines.append(f"<b>SHORT:</b> {len(shorts)} сд. | WR {short_wr:.1f}%")
+    lines.append(f"\n<b>LONG:</b> {len(longs)} | WR {long_wr:.1f}%")
+    lines.append(f"<b>SHORT:</b> {len(shorts)} | WR {short_wr:.1f}%")
 
     by_sym = {}
     for t in trades:
@@ -264,6 +252,6 @@ def stats_report_tm(trades):
     for sym, rs in sorted(by_sym.items(), key=lambda x: -sum(x[1])):
         rs_arr = np.array(rs)
         s_wr = (rs_arr > 0).sum() / len(rs_arr) * 100
-        lines.append(f"  {sym}: {len(rs)} сд. | WR {s_wr:.1f}% | ΣR {rs_arr.sum():+.1f}")
+        lines.append(f"  {sym}: {len(rs)} | WR {s_wr:.1f}% | ΣR {rs_arr.sum():+.1f}")
 
     return "\n".join(lines)
